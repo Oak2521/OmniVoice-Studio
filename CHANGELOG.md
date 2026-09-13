@@ -23,6 +23,7 @@ the frozen-backend fallback mirror it for their toolchains.
 
 ### Fixed
 
+- Watermark detection and inbound worker status keep internal exception details in backend diagnostics instead of API responses (#1)
 - Stopping a process on macOS no longer fails with "Operation not permitted" when it was already exiting (#2032)
 - A YouTube link blocked by its "not a bot" check now says how to attach signed-in cookies in Dub, instead of quoting yt-dlp's command-line flags (#2036, #2034)
 - An engine that fails to start now says whether it timed out, crashed (with its exit code and last output) or answered wrongly, instead of "did not signal ready: None" (#2037, #2026)

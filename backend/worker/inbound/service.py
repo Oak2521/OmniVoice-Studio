@@ -424,7 +424,13 @@ class InboundNode:
             "bind": host,
             "port": self.port or bind_port(),
             "exposed": is_exposed(host),
-            "startup_error": self.startup_error,
+            # The private diagnostic survives a failed start followed by stop.
+            # Status/disable responses must not serialize that exception text.
+            "startup_error": (
+                "The inbound worker listener could not start; "
+                "check the backend log for details."
+                if self.startup_error else None
+            ),
             "tls_fingerprint": self._credentials.fingerprint
             if self._credentials
             else "",
