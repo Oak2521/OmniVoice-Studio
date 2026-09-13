@@ -12,7 +12,7 @@ The private key needs to live in **GitHub Actions Secrets** so CI can sign each 
    ```
    cat ~/.tauri/omnivoice-updater.key
    ```
-2. GitHub → Settings → Secrets and variables → Actions → **New repository secret** (on `debpalash/OmniVoice-Studio`, which is where the updater endpoint points):
+2. GitHub → Settings → Secrets and variables → Actions → **New repository secret** (on `debpalash/VoiceStudio`, which is where the updater endpoint points):
    - Name: `TAURI_SIGNING_PRIVATE_KEY`
    - Value: paste the full contents (including the `untrusted comment:` header line)
 3. Add a second secret:
@@ -30,7 +30,7 @@ No Apple Developer / Windows signing certs needed for v1. Apps ship unsigned; fi
 ## 3. What the updater does
 
 On every app launch, the webview:
-1. Fetches `https://github.com/debpalash/OmniVoice-Studio/releases/latest/download/latest.json`
+1. Fetches `https://github.com/debpalash/VoiceStudio/releases/latest/download/latest.json`
 2. Compares the version in `latest.json` to the running app's version (from `tauri.conf.json`)
 3. If newer, shows a native dialog: *"A new version (x.y.z) is available. Download and install now?"*
 4. If user accepts, downloads the signed update bundle, verifies the minisign signature against the embedded pubkey, replaces the app in place, relaunches.
@@ -39,26 +39,36 @@ Failures (no network, 404, signature mismatch) are silent — the app continues 
 
 ## 4. Version bumps
 
-Two files must agree before you tag a release:
+`frontend/package.json` is the **single source of truth** for the app version
+(hard rule, owner-set 2026-06-16 — full rationale in CLAUDE.md → Conventions →
+Versioning). Vite injects `__APP_VERSION__` from it, and
+`frontend/src-tauri/tauri.conf.json` derives its bundle version from it
+(`"version": "../package.json"` — never hand-edit a literal back in). Three
+toolchain-required mirrors are bumped in lockstep:
 
-- `frontend/src-tauri/tauri.conf.json` → `"version": "0.2.0"`
-- `frontend/src-tauri/Cargo.toml` → `version = "0.2.0"`
+- `frontend/src-tauri/Cargo.toml`
+- `pyproject.toml`
+- `backend/core/version.py` (`_FALLBACK_VERSION`)
 
-(Not `frontend/package.json` — Tauri ignores it.)
-
-Keep bumps monotonic. Tauri updater uses semver comparison, so `v0.2.0` does not update clients already on `v0.2.1`.
+Lockstep is guarded by `tests/test_app_version.py`. With `AUTO_VERSION_BUMP`
+off (the current owner setting), `main` holds at the released version between
+releases; the post-release bump to `X.Y.(Z+1)` happens only when the owner
+asks. Keep bumps monotonic — the updater uses semver comparison, so `v0.2.0`
+does not update clients already on `v0.2.1`.
 
 ## 5. Cutting a release
 
-```bash
-# 1. Bump versions in the two files above, commit.
-git add frontend/src-tauri/tauri.conf.json frontend/src-tauri/Cargo.toml
-git commit -m "release: v0.2.0"
+1. **CHANGELOG first (hard rule):** make sure `CHANGELOG.md` has a complete,
+   user-facing `## [X.Y.Z] — DATE` section (rename `## [Unreleased]`).
+   `release.yml` extracts that section verbatim as the GitHub Release body —
+   a missing section ships a bare release.
+2. Verify the version files match the tag you're about to cut:
+   `uv run pytest tests/test_app_version.py -q`.
+3. Tag and push:
 
-# 2. Tag and push.
-git tag v0.2.0
-git push origin main
-git push origin v0.2.0
+```bash
+git tag vX.Y.Z
+git push origin vX.Y.Z
 ```
 
 The `Desktop Release` workflow fires on tag push. It builds four targets in parallel on GitHub Actions runners:
@@ -67,15 +77,43 @@ The `Desktop Release` workflow fires on tag push. It builds four targets in para
 |---|---|---|
 | macOS Apple Silicon | macos-14 | `.dmg` + updater `.app.tar.gz` |
 | macOS Intel | macos-13 | `.dmg` + updater `.app.tar.gz` |
-| Windows x64 | windows-2022 | `.msi` + `.exe` + updater `.nsis.zip` |
-| Linux x64 | ubuntu-22.04 | `.AppImage` + `.deb` + updater `.AppImage.tar.gz` |
+| Windows x64 | windows-2022 | `.msi`, machine-wide and per-user, each with its updater `.sig` |
+| Linux x64 | ubuntu-22.04 | `.AppImage` + updater `.AppImage.sig` |
 
 Each runner signs the updater payload with the stored `TAURI_SIGNING_PRIVATE_KEY`, merges into a single `latest.json`, and attaches everything to the draft release.
 
 Workflow runtime: **~20-40 minutes** (PyInstaller + four platform builds). Follow progress at:
-`https://github.com/debpalash/OmniVoice-Studio/actions`
+`https://github.com/debpalash/VoiceStudio/actions`
 
-When it finishes, the draft release needs manual publishing — GitHub → Releases → **Edit** the draft → **Publish release**. Once published, existing clients detect the update on their next launch.
+The release stays a draft while the platforms build. Once every platform, the
+updater-manifest repair and the uninstall scripts are done, the
+`release-notes-checksums` job writes all four platforms' checksums into the
+notes and publishes it, with no manual step. A failed platform leaves the
+release a draft, so nothing half-built goes public. Existing clients detect
+the update on their next launch.
+
+## 5b. Deployment channels — all must ship (hard rule, owner-set 2026-07-16)
+
+A version bump is not "released" until **every** channel below carries it.
+Verify each one after the workflows finish — a missing channel is a release
+bug to fix immediately, not backlog.
+
+| Channel | Source | Produced by | How to verify |
+|---|---|---|---|
+| GitHub Release: installers + signed `latest.json` (**Stable** updater channel) | the `vX.Y.Z` tag | `release.yml` on tag push | Release page has dmg (arm+intel), msi (machine-wide and per-user), AppImage, `latest.json` and `latest-user.json`; body = the CHANGELOG section (not the auto-generated fallback), followed by per-platform checksums and a **Contributors** avatar strip (owner + every PR author for the tag — the `contributors-strip` job) |
+| **Preview** updater channel (rolling `preview` prerelease) | **`main` only** | `release.yml` nightly cron / manual dispatch | preview `latest.json` uses main's version when it is ahead; otherwise it advances the stable patch, then appends `-N` so it semver-sorts above stable |
+| GHCR CUDA image: `:X.Y.Z`, `:X.Y`, `:stable` | the tag | `docker.yml` on tag push | `docker manifest inspect ghcr.io/debpalash/omnivoice-studio:X.Y.Z` |
+| GHCR ROCm image: `:X.Y.Z-rocm`, `:X.Y-rocm`, `:stable-rocm` | the tag | `docker.yml` on tag push | same, with `-rocm` suffix |
+| Docker Hub mirror of **all** the above tags | the tag | `docker.yml` (gated on `DOCKERHUB_*` secrets) | tag list at hub.docker.com/r/palashdeb/omnivoice-studio/tags |
+| Docker Hub **overview page** | `deploy/dockerhub-overview.md` @ main | `docker.yml` on main pushes | **read the step log, not the job status** — the step is `continue-on-error` and 403s silently when `DOCKERHUB_TOKEN` lacks description-edit scope |
+| Rolling Docker previews: `:latest`, `:main`, `:rocm` | **`main` only** | `docker.yml` on every main push | tag timestamps move with main |
+
+**Preview/RC policy:** there are no RC tags (beta cadence — see CLAUDE.md).
+The preview channel *is* the release candidate, and it **always builds from
+`main`** — the preview-gate in `release.yml` refuses `publish_preview` from
+any other branch, and the rolling Docker tags track `main` by construction.
+To get users testing a fix: merge to `main`, then cut a preview. Never a
+side-branch build.
 
 ## 6. Expect-to-fail-first-time on Windows and Linux
 
@@ -94,13 +132,13 @@ Two options:
 **Option A — dry run the manifest:**
 After a release is published, hit the updater URL manually:
 ```
-curl -L https://github.com/debpalash/OmniVoice-Studio/releases/latest/download/latest.json | jq
+curl -L https://github.com/debpalash/VoiceStudio/releases/latest/download/latest.json | jq
 ```
 You should see platform-keyed download URLs + minisign signatures. If that JSON looks right, clients will pick it up.
 
 **Option B — full end-to-end:**
 1. Install v0.1.0 on a fresh machine (or clean-installed Applications).
-2. Cut v0.2.0 (bump, tag, push, wait for CI, publish draft).
+2. Cut v0.2.0 (bump, tag, push, wait for CI; the workflow publishes the release).
 3. Launch the installed v0.1.0. Within seconds, the dialog should appear.
 4. Accept → app downloads, verifies, replaces, relaunches as v0.2.0.
 
@@ -114,3 +152,12 @@ There's no "revert update" flow for clients — they'll only see a *newer* versi
 3. Clients auto-update to the "new" v0.2.1 which is actually the old code.
 
 Ugly but it works. Better plan: test with Option B above before publishing the draft.
+
+## Retrying a partially published build
+
+Use GitHub Actions **Re-run failed jobs** for the same release run. On retries,
+the workflow removes only the current version's installers for that job's target
+before Tauri uploads them again. A macOS retry also replaces that architecture's
+versionless updater archive. Other versions, sibling platforms, and updater
+manifests remain intact. Inventory or deletion permission/network failures stop
+the job instead of hiding an upload collision.

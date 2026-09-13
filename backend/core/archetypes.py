@@ -1,10 +1,10 @@
 """Designed-voice archetype engine for the Voice Gallery.
 
 This module produces a large catalog of ready-to-use *designed* voices — no
-real people, no cloning — built entirely from OmniVoice's own voice-design
+real people, no cloning — built entirely from VoiceStudio's own voice-design
 taxonomy. Each archetype carries an ``instruct`` string (e.g.
 ``"female, middle-aged, low pitch, british accent"``) that flows straight into
-``OmniVoice.generate(instruct=...)``.
+``VoiceStudio.generate(instruct=...)``.
 
 Two tiers (the "hybrid" gallery model):
 
@@ -311,7 +311,7 @@ def _make_featured():
 # ── Featured: multilingual designed voices ────────────────────────────────────
 # The voice-design *timbre* axes (gender/age/pitch) are language-independent, and
 # the spoken language of a designed voice is driven by the preview *text*, not by
-# the instruct — the same neutral instruct renders in any of OmniVoice's 646
+# the instruct — the same neutral instruct renders in any of VoiceStudio's 646
 # languages (the exact ``model.generate(text=…, language=…, instruct=…)`` call
 # the Generate tab already makes). So we ship a curated set in the major languages
 # the app already localizes its UI into, giving the gallery more than English +
@@ -436,10 +436,22 @@ _BY_ID = {a["id"]: a for a in _ALL}
 
 
 # ── Public query API ──────────────────────────────────────────────────────────
-def list_archetypes(use_case=None, gender=None, age=None, pitch=None, accent=None,
+def list_archetypes(q=None, use_case=None, gender=None, age=None, pitch=None, accent=None,
                     whisper=None, lang=None, featured=None, limit=None, offset=0):
-    """Filtered view over the full catalog (featured + generated)."""
+    """Filtered view over the full catalog (featured + generated).
+
+    ``q`` is a case-insensitive substring match over each archetype's name and
+    instruct string, so a picker can reach any voice by typing (e.g. "british",
+    "librarian", "whisper") rather than only via the exact facet enums.
+    """
     items = _ALL
+    if q:
+        needle = q.strip().lower()
+        if needle:
+            items = [
+                a for a in items
+                if needle in a["name"].lower() or needle in a["instruct"].lower()
+            ]
     if featured is not None:
         items = [a for a in items if a["is_featured"] is featured]
     if use_case:

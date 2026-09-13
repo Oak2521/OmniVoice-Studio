@@ -1,134 +1,149 @@
-# OmniVoice Studio — IndexTTS-2 Engine
+# VoiceStudio — IndexTTS 2.5
 
-IndexTTS-2 (Bilibili) is OmniVoice's emotion-controlled zero-shot TTS
-engine. It runs in its own subprocess + dedicated Python venv with
-`transformers<5`, isolated from the OmniVoice parent process which
-pins `transformers>=5.3`. This isolation is the resolution of
-[#42](https://github.com/voice-design/OmniVoice/issues/42) — the
-canonical `OffloadedCache` ImportError that resulted from loading
-both libraries inside one Python interpreter.
+IndexTTS 2.5 is an optional, multilingual voice-cloning engine for dubbing
+and expressive speech. It supports Chinese, English, Japanese, Spanish, and
+Arabic, with reference-audio cloning, emotion references, emotion vectors,
+and text-directed emotion.
+
+VoiceStudio runs IndexTTS in a dedicated subprocess and Python environment.
+This keeps its `transformers<5` dependency isolated from VoiceStudio's
+runtime. Existing user-managed IndexTTS-2 environments remain supported.
 
 ## Install
 
-IndexTTS-2 is **not** bundled with OmniVoice — the model weights are
-~6 GB and the package itself pins a conflicting transformers
-version. OmniVoice ships with a sidecar runner that loads IndexTTS
-into an isolated venv on demand.
+IndexTTS 2.5 is not bundled because its source environment and model weights
+require substantial disk space.
 
-1. Clone the IndexTTS repo on disk:
+1. Open **Model Catalogue**.
+2. Expand **IndexTTS 2.5** and select **Install**.
+3. Keep VoiceStudio open while source, dependencies, and weights download.
 
-   ```bash
-   git clone https://github.com/index-tts/index-tts.git
-   ```
+The installer:
 
-2. Install the editable package into a fresh venv. Use
-   `uv pip install -e .` — **never** `uv sync --all-extras`, which
-   would overwrite OmniVoice's lock file with `transformers<5` and
-   break the parent process:
+- checks for `uv` and at least 12 GB of free space;
+- installs the reviewed `indextts-2.5` source revision in an isolated venv;
+- downloads the reviewed `IndexTeam/IndexTTS-2.5` model revision;
+- resumes partial model downloads;
+- saves `OMNIVOICE_INDEXTTS_DIR` and activates the engine without a restart.
 
-   ```bash
-   cd index-tts
-   uv venv .venv
-   uv pip install -e .
-   ```
+An app-managed IndexTTS-2 checkout remains intact while 2.5 installs into a
+separate directory. VoiceStudio switches to 2.5 only after the new source,
+environment, and weights pass verification. User-managed clones are never
+modified or removed; their legacy
+`indextts.infer_v2` entry point remains supported.
 
-3. Download the model weights (~6 GB). Either:
+## Manual install
 
-   ```bash
-   hf download IndexTeam/IndexTTS-2 --local-dir=checkpoints
-   ```
-
-   or let HuggingFace cache them on first synthesize call (the parent
-   forwards `HF_HOME` / `HF_HUB_CACHE` to the sidecar so the cache is
-   shared with the rest of OmniVoice's downloads).
-
-4. Set the `OMNIVOICE_INDEXTTS_DIR` environment variable to the repo
-   root (the directory that contains `checkpoints/` and
-   `pyproject.toml`):
-
-   ```bash
-   # macOS / Linux
-   echo 'export OMNIVOICE_INDEXTTS_DIR=$HOME/code/index-tts' >> ~/.zshrc
-   source ~/.zshrc
-   ```
-
-   ```powershell
-   # Windows PowerShell
-   [Environment]::SetEnvironmentVariable("OMNIVOICE_INDEXTTS_DIR","$env:USERPROFILE\code\index-tts","User")
-   ```
-
-5. Restart OmniVoice. IndexTTS-2 will appear in **Settings → Engines**
-   with `available: true` and `isolation_mode: subprocess`.
-
-## Venv resolution order
-
-OmniVoice probes for a usable IndexTTS Python interpreter in this
-priority order (see `backend/engines/indextts/bootstrap.py`):
-
-1. **`${OMNIVOICE_INDEXTTS_DIR}/.venv/`** — your existing clone's
-   venv. Highest priority, so v0.2.7 users who already ran
-   `uv pip install -e .` get zero migration cost on the upgrade to
-   v0.3.x.
-2. **`backend/engines/indextts/.venv/`** — OmniVoice's own venv,
-   created on demand by step 3.
-3. **Lazy bootstrap** — if neither venv exists, OmniVoice runs
-   `uv venv backend/engines/indextts/.venv` and
-   `uv pip install --python <python> -e ${OMNIVOICE_INDEXTTS_DIR}`
-   on first launch. Requires `OMNIVOICE_INDEXTTS_DIR` to be set;
-   raises a clear error otherwise.
-
-The cache marker test
-(`tests/backend/services/test_indextts_backward_compat.py::test_hf_home_marker_present_after_bootstrap`)
-proves that the bootstrap path **never** mutates
-`$HF_HOME/hub/models--IndexTeam--IndexTTS-2/` — so the 6 GB model
-weights survive the upgrade byte-for-byte.
-
-## Common errors
-
-### `IndexTTS-2 venv not found. Set OMNIVOICE_INDEXTTS_DIR ...`
-
-You haven't pointed OmniVoice at an IndexTTS clone yet. Follow the
-**Install** steps above.
-
-### `uv is required to bootstrap the IndexTTS-2 venv but was not found on PATH`
-
-The bootstrap path needs a working `uv` binary. Either install `uv`
-into your `PATH` (https://docs.astral.sh/uv/) or pre-create the venv
-manually with `uv venv` and `uv pip install -e` as in step 2.
-
-### `IndexTTS bootstrap completed but `import indextts.infer_v2` still fails`
-
-The clone at `OMNIVOICE_INDEXTTS_DIR` is missing the indextts
-package. Verify with:
+Use a separate checkout and venv. Do not install IndexTTS into VoiceStudio's
+root environment.
 
 ```bash
-ls "$OMNIVOICE_INDEXTTS_DIR/pyproject.toml"   # should exist
-ls "$OMNIVOICE_INDEXTTS_DIR/indextts/"        # should exist
+git clone --branch indextts-2.5 https://github.com/index-tts/index-tts.git
+cd index-tts
+uv venv .venv
+uv pip install --python .venv/bin/python -e .
+hf download IndexTeam/IndexTTS-2.5 --local-dir=checkpoints
 ```
 
-If the directory is correct but the import still fails, delete
-`backend/engines/indextts/.venv/` and re-launch — OmniVoice will
-re-bootstrap from scratch.
+On Windows, replace `.venv/bin/python` with `.venv\Scripts\python.exe`.
+Then set `OMNIVOICE_INDEXTTS_DIR` to the checkout root:
 
-## Why a subprocess?
+```bash
+export OMNIVOICE_INDEXTTS_DIR=/path/to/index-tts
+```
 
-IndexTTS-2 pins `transformers<5`. OmniVoice pins `transformers>=5.3`.
-The two cannot share a Python interpreter — at import time, one of
-them blows up trying to find a class the other moved or removed (the
-canonical failure is `OffloadedCache` from `transformers.cache_utils`,
-which v5 renamed). Running IndexTTS in its own subprocess + its own
-venv lets both libraries coexist in the same OmniVoice session.
+```powershell
+[Environment]::SetEnvironmentVariable(
+  "OMNIVOICE_INDEXTTS_DIR",
+  "$env:USERPROFILE\code\index-tts",
+  "User"
+)
+```
 
-This is the structural fix for issue #42; the previous
-graceful-degradation wrap (which simply detected the conflict and
-disabled IndexTTS) is replaced by a real isolation primitive
-(`backend/services/subprocess_backend.py::SubprocessBackend`, shipped
-in Plan 02-01).
+Restart VoiceStudio after setting a persistent environment variable outside
+the app.
+
+## Compatibility
+
+VoiceStudio probes these locations in order:
+
+1. `${OMNIVOICE_INDEXTTS_DIR}/.venv/`;
+2. `backend/engines/indextts/.venv/`;
+3. a venv bootstrapped from `OMNIVOICE_INDEXTTS_DIR`.
+
+The probe prefers `indextts.infer_v2_5` and falls back to
+`indextts.infer_v2`. A timed-out import is treated as unproven rather than
+missing, preventing slow disks or antivirus scans from hiding a valid venv.
+Set `OMNIVOICE_INDEXTTS_IMPORT_PROBE_TIMEOUT_S` to raise the default 60-second
+probe limit.
+
+### Long-text generation
+
+A long passage can keep `infer()` busy for several minutes. The sidecar emits a
+keep-alive frame every 5 seconds while it works, so the parent can tell a slow
+synthesis from a wedged one, and waits up to 900 seconds for a sidecar that has
+gone genuinely silent. Set `OMNIVOICE_INDEXTTS_RECV_TIMEOUT_S` (minimum 30) to
+tune that ceiling.
+
+IndexTTS 2.5 requires a language token. VoiceStudio maps locale codes and
+language names to the five supported languages and detects Chinese, Japanese,
+or Arabic script for Auto requests. Ambiguous Latin text defaults to English.
+
+IndexTTS 2.5 uses `duration_factor` for native duration guidance. VoiceStudio's
+dubbing fit stage remains responsible for exact segment timing. Legacy
+IndexTTS-2 installations continue receiving their `target_tokens` control.
+
+## Troubleshooting
+
+### Engine unavailable
+
+Use **Model Catalogue → IndexTTS 2.5 → Install**. For a manual install,
+confirm that the configured directory contains:
+
+```text
+pyproject.toml
+indextts/infer_v2_5.py
+checkpoints/config.yaml
+```
+
+`IndexTeam/IndexTTS-2.5` ships the model config as `config.yaml`. Earlier
+installs only worked after hand-renaming it to `config_v2_5.yaml`; both names
+are accepted, so a renamed checkout keeps working as-is and needs no
+reinstall.
+
+### `uv` not found
+
+Install `uv` from <https://docs.astral.sh/uv/> or configure the bundled binary
+through `OMNIVOICE_BUNDLED_UV`.
+
+### Import fails after installation
+
+For an app-managed install, retry **Install** to repair the source and venv.
+For a manual install, run:
+
+```bash
+uv pip install --python .venv/bin/python -e .
+```
+
+### Insufficient disk space
+
+Free the amount reported by the installer, then retry. Completed model files
+are reused.
 
 ## License
 
-IndexTTS-2 ships under a custom Bilibili research license — free for
-research / non-commercial use. Commercial use requires contacting
-`indexspeech@bilibili.com`. See the upstream
-[README](https://github.com/index-tts/index-tts/blob/main/README.md)
-for the full terms.
+IndexTTS 2.5 uses the bilibili Model Use License. It grants a limited,
+worldwide, non-exclusive, royalty-free license subject to its restrictions.
+A separate license is required when the user or an affiliate exceeded 100
+million monthly active users in the preceding month or RMB 1 billion in annual
+revenue in the preceding year. The agreement also includes downstream,
+derivative-work, prohibited-use, attribution, and compliance obligations.
+Review the [official license](https://huggingface.co/IndexTeam/IndexTTS-2.5/blob/main/LICENSE)
+before installing or using the model.
+
+This model is not covered by VoiceStudio's blanket commercial-use statement.
+Organizations above either threshold must obtain Bilibili's separate written
+license before installing or using IndexTTS 2.5. Other engines remain available
+without enabling this optional sidecar.
+
+See [Engine venvs and disk usage](disk-usage.md) for storage details.

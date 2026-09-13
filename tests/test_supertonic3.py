@@ -208,7 +208,7 @@ def test_cpu_only_honest(mock_settings_store):
 @pytest.mark.skipif(not _SUPERTONIC_INSTALLED, reason="supertonic optional dep not installed (uv sync --all-extras)")
 def test_license_gate(mock_settings_store):
     """Until the user accepts the license, is_available() returns False
-    with a Settings → Engines hint. After accept, it flips True."""
+    with a Model Catalogue hint. After accept, it flips True."""
     mock_settings_store.pop("supertonic3", None)
     from engines.supertonic3.backend import Supertonic3Backend
 
@@ -216,8 +216,11 @@ def test_license_gate(mock_settings_store):
     assert ok is False, (
         f"expected ok=False with license unaccepted, got ({ok!r}, {msg!r})"
     )
-    assert "Settings" in msg and "Engines" in msg, (
-        f"reason should point the user at Settings → Engines: {msg!r}"
+    # Engines moved out of Settings into the Model Catalogue workspace, so the
+    # hint names that; what must not drift is that it names a place the user
+    # can actually reach the accept button from.
+    assert "Model Catalogue" in msg and "Accept" in msg, (
+        f"reason should point the user at Model Catalogue: {msg!r}"
     )
     assert "license" in msg.lower()
 
@@ -231,7 +234,7 @@ def test_license_gate(mock_settings_store):
 
 def test_optional_dep_missing(monkeypatch, mock_settings_store):
     """If ``import supertonic`` fails, is_available() returns False with
-    an install hint that mentions Settings → Engines or `uv add`."""
+    an install hint that mentions Model Catalogue or `uv add`."""
     mock_settings_store["supertonic3"] = True
 
     real_import = builtins.__import__
@@ -250,8 +253,8 @@ def test_optional_dep_missing(monkeypatch, mock_settings_store):
 
     ok, msg = Supertonic3Backend.is_available()
     assert ok is False
-    assert any(needle in msg for needle in ("uv add", "Settings", "supertonic")), (
-        f"install hint should mention 'uv add' or 'Settings': {msg!r}"
+    assert any(needle in msg for needle in ("uv add", "Model Catalogue", "supertonic")), (
+        f"install hint should mention 'uv add' or Model Catalogue: {msg!r}"
     )
 
 
@@ -378,3 +381,45 @@ def test_extra_env_carries_revision(mock_settings_store):
     assert os.environ.get("SUPERTONIC3_REVISION") == constants.PINNED_REVISION_SHA
     # And the property surfaces the same value.
     assert backend._sidecar_env["SUPERTONIC3_REVISION"] == constants.PINNED_REVISION_SHA
+
+
+def test_prefers_the_venv_its_one_click_install_made(monkeypatch, tmp_path, mock_settings_store):
+    """Its own venv when the installer made one; otherwise the app's
+    interpreter, where `uv sync --extra supertonic` installs it."""
+    from pathlib import Path
+
+    from engines.supertonic3.backend import Supertonic3Backend
+    from services.sidecar_install import _INSTALL_COMPLETE_MARKER, _venv_python
+
+    mock_settings_store["supertonic3"] = True
+    monkeypatch.delenv("OMNIVOICE_SUPERTONIC3_DIR", raising=False)
+    assert Supertonic3Backend.venv_python() == Path(sys.executable)
+
+    py = _venv_python(tmp_path / ".venv")
+    py.parent.mkdir(parents=True)
+    py.write_text("#!fake\n")
+    (tmp_path / _INSTALL_COMPLETE_MARKER).write_text("x\n", encoding="utf-8")
+    monkeypatch.setenv("OMNIVOICE_SUPERTONIC3_DIR", str(tmp_path))
+    assert Supertonic3Backend.venv_python() == py
+    # Available without supertonic importable in the app's own environment.
+    monkeypatch.setitem(sys.modules, "supertonic", None)
+    ok, msg = Supertonic3Backend.is_available()
+    assert ok is True, msg
+
+
+def test_sidecar_resolves_its_pin_without_the_app_backend(monkeypatch):
+    """In its own venv the app's backend package is absent. The fallback must
+    not import `engines.supertonic3`, whose __init__ imports the backend."""
+    import importlib.util
+    from pathlib import Path
+
+    from engines.supertonic3 import constants
+
+    monkeypatch.delenv("SUPERTONIC3_REVISION", raising=False)
+    monkeypatch.setitem(sys.modules, "engines", None)
+    monkeypatch.setitem(sys.modules, "backend", None)
+    path = Path(constants.__file__).with_name("sidecar.py")
+    spec = importlib.util.spec_from_file_location("_st3_sidecar_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert module._resolve_pinned_sha() == constants.PINNED_REVISION_SHA

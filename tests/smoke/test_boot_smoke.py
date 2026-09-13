@@ -44,24 +44,50 @@ if not FIXTURE_SRC.exists():
 _FIXTURE_COPY = Path(tempfile.mkdtemp(prefix="omnivoice-smoke-"))
 shutil.copytree(FIXTURE_SRC, _FIXTURE_COPY, dirs_exist_ok=True)
 
-# Point backend.core.config.get_app_data_dir() at the COPY. Force-override
-# (not setdefault) — earlier tests in a full-suite run may have set it to
-# their own temp dir, and core.config caches DB_PATH at first import.
-os.environ["OMNIVOICE_DATA_DIR"] = str(_FIXTURE_COPY)
+
+def _purge_backend_modules():
+    """Drop cached backend modules so the next import re-reads the CURRENT
+    env — `core.config` caches DB_PATH/VOICES_DIR at import time. Same
+    pattern as tests/backend/services/conftest.py.
+
+    The bare package names ("api", "services") must be purged along with
+    their submodules: a surviving stale package object keeps attribute
+    bindings to STALE submodules, so `from services import asr_backend`
+    resolves the stale twin while `from services.asr_backend import ...`
+    re-imports a fresh one — fixture patches then land on the module the
+    code under test never sees."""
+    for mod in list(sys.modules):
+        if (
+            mod in ("main", "core", "api", "services")
+            or mod.startswith("core.")
+            or mod.startswith("api.")
+            or mod.startswith("services.")
+        ):
+            sys.modules.pop(mod, None)
 
 
 @pytest.fixture(scope="module")
 def client():
-    # Purge any cached backend modules from earlier tests in the suite —
-    # `core.config` reads OMNIVOICE_DATA_DIR at import time and caches DB_PATH,
-    # so a prior import with a different value would survive the env-var
-    # override above. Same pattern as tests/backend/services/conftest.py.
-    for mod in list(sys.modules):
-        if mod == "main" or mod == "core" or mod.startswith("core.") or mod.startswith("api.") or mod.startswith("services."):
-            sys.modules.pop(mod, None)
+    # Point backend.core.config.get_app_data_dir() at the COPY, scoped to
+    # THIS module and undone afterwards. This used to be a module-level
+    # `os.environ["OMNIVOICE_DATA_DIR"] = ...` — a process-wide leak: in a
+    # combined `pytest tests/ backend/tests/` run every later fresh import
+    # of core.config resolved DB/voices paths into the smoke fixture copy,
+    # breaking backend/tests (personas import wrote voices into one data
+    # dir while the test asserted another; audiobook resume read a
+    # different DB than it seeded). CI's isolated invocations never see
+    # combined-run leaks, so keep this bubble airtight for local runs.
+    mp = pytest.MonkeyPatch()
+    mp.setenv("OMNIVOICE_DATA_DIR", str(_FIXTURE_COPY))
+    _purge_backend_modules()
     from fastapi.testclient import TestClient
     from main import app
-    return TestClient(app, client=("127.0.0.1", 50000))
+    yield TestClient(app, client=("127.0.0.1", 50000))
+    # Teardown mirrors setup: purge the modules imported under the smoke
+    # env FIRST, then restore the env — later tests re-import against the
+    # restored OMNIVOICE_DATA_DIR instead of inheriting smoke-bound paths.
+    _purge_backend_modules()
+    mp.undo()
 
 
 # ── tests ──────────────────────────────────────────────────────────────────

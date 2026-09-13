@@ -1,10 +1,13 @@
-import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react'
-import tailwindcss from '@tailwindcss/vite'
-import path from 'path'
-import { readFileSync } from 'fs'
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+import tailwindcss from '@tailwindcss/vite';
+import path from 'path';
+import { readFileSync } from 'fs';
+import { resolveDialogEsm } from './resolveDialogEsm.mjs';
 
 const pkg = JSON.parse(readFileSync(path.resolve(__dirname, 'package.json'), 'utf-8'));
+
+const dialogEsm = resolveDialogEsm(__dirname);
 
 // https://vite.dev/config/
 export default defineConfig({
@@ -16,7 +19,15 @@ export default defineConfig({
   resolve: {
     preserveSymlinks: false,
     alias: {
-      '@tauri-apps/plugin-dialog': path.resolve(__dirname, 'node_modules/@tauri-apps/plugin-dialog/dist-js/index.js'),
+      // shadcn/ui convention: `@/…` resolves to `src/…` (mirrored in
+      // tsconfig.json `paths` so the type-checker agrees). Lets shadcn
+      // primitives import `@/lib/utils` and `npx shadcn add` work unmodified.
+      '@': path.resolve(__dirname, 'src'),
+      // Package managers may install this nested (frontend/node_modules) or
+      // hoisted to the workspace root; a hardcoded path breaks whichever
+      // layout it did not guess. Probe both, and fall through to Vite's own
+      // resolution when neither exists rather than crashing the optimizer.
+      ...(dialogEsm ? { '@tauri-apps/plugin-dialog': dialogEsm } : {}),
     },
   },
   server: {
@@ -24,7 +35,7 @@ export default defineConfig({
     strictPort: true,
     host: false,
     watch: {
-      ignored: ["**/src-tauri/**"],
+      ignored: ['**/src-tauri/**'],
     },
   },
   test: {
@@ -34,5 +45,4 @@ export default defineConfig({
     include: ['src/**/*.test.{js,jsx,ts,tsx}'],
     css: false,
   },
-})
-
+});

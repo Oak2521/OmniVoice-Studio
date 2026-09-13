@@ -17,6 +17,8 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
+import functools
+import re
 import os
 import shutil
 import subprocess
@@ -91,10 +93,14 @@ REGISTRY: dict[str, dict] = {
         "probe_module": "openai",
         "category": "llm",
         "needs_key": True,
+        # A core dependency: Settings → LLM Providers uses it too.
+        "builtin": True,
         "notes": (
-            "Any OpenAI-compatible endpoint: GPT-4/5 (OpenAI), Claude (via OpenRouter), "
-            "Gemini (OpenAI-compat mode), DeepSeek, Qwen, Ollama, LM Studio. "
-            "Set TRANSLATE_BASE_URL + TRANSLATE_API_KEY + TRANSLATE_MODEL."
+            "Uses the LLM provider you configure in Settings → LLM Providers "
+            "(route it via the 'Dub translation' skill in Settings → LLM Skills): "
+            "GPT (OpenAI), Claude (via OpenRouter), Gemini, DeepSeek, Qwen, "
+            "Ollama, LM Studio. Power-user env override: TRANSLATE_BASE_URL + "
+            "TRANSLATE_API_KEY + TRANSLATE_MODEL."
         ),
     },
 }
@@ -120,17 +126,122 @@ def _probe(entry: dict) -> tuple[bool, str]:
         return False, f"import {mod!r} failed: {e}"
 
 
+def install_command(engine: "str | dict | None") -> str | None:
+    """The exact shell command that makes this engine importable, or None.
+
+    Single source of truth for the install string. BOTH the proactive Install
+    affordance in the Engine selector (via list_engines' ``install_command``
+    field) AND the translate-time 400 error (dub_translate.py) read from here,
+    so the command a user is told to run can never drift between the two
+    surfaces. Returns None when the engine needs no separate install — either
+    it's unknown or its dependency is a core dep already pinned in
+    ``pyproject.toml`` (e.g. NLLB → transformers), in which case a
+    ``uv pip install`` line would be misleading.
+    """
+    entry = engine if isinstance(engine, dict) else REGISTRY.get(engine) if engine else None
+    pkg = entry.get("pip_package") if entry else None
+    return f"uv pip install {pkg}" if pkg else None
+
+
+def _llm_configured() -> tuple[bool, "str | None"]:
+    """Whether the LLM translation engine has something to call, and via what.
+
+    Resolution mirrors the translate-time path in dub_translate.py: the
+    "dub_translation" LLM skill (per-skill override → active provider from
+    Settings → LLM Providers) first, then the TRANSLATE_* env override. Lets
+    the Engine dropdown say "ready via <provider>" / "needs setup" up front
+    instead of a per-segment failure after the user clicks Translate.
+    """
+    try:
+        from services import llm_skills
+        res = llm_skills.resolve_skill("dub_translation")
+        if res.ready and res.provider is not None:
+            return True, res.provider.display_name
+    except Exception:  # noqa: BLE001 — a probe must never break list_engines()
+        logger.debug("dub_translation skill probe failed", exc_info=True)
+    if os.environ.get("TRANSLATE_BASE_URL") or os.environ.get("TRANSLATE_API_KEY"):
+        return True, "env"
+    return False, None
+
+
 def list_engines() -> list[dict]:
     """Return a UI-ready list with per-engine availability stamped in."""
     out = []
     for e in REGISTRY.values():
         installed, reason = _probe(e)
-        out.append({
+        entry = {
             **e,
             "installed": installed,
             "availability_reason": reason,
-        })
+            "install_command": install_command(e),
+        }
+        # LLM engines additionally need a provider/key — surface configured-ness
+        # so the UI can distinguish "importable" from "actually ready to call".
+        if e.get("category") == "llm":
+            configured, via = _llm_configured()
+            entry["configured"] = configured
+            entry["configured_via"] = via
+        out.append(entry)
     return out
+
+
+def _normalize(name: str) -> str:
+    """A distribution name in PEP 503 form (deep_translator == deep-translator)."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+@functools.lru_cache(maxsize=1)
+def _app_dependency_names() -> frozenset[str]:
+    """Distribution names VoiceStudio itself requires, normalized.
+
+    Read from the installed package metadata, so it follows the lockfile with
+    no second list to keep in step. Without metadata this guards nothing
+    rather than failing.
+    """
+    try:
+        from importlib.metadata import requires
+
+        reqs = requires("omnivoice") or []
+    except Exception:  # noqa: BLE001
+        return frozenset()
+    names = set()
+    for req in reqs:
+        if "extra ==" in req:
+            continue
+        names.add(_normalize(re.split(r"[\s;<>=!~\[@(]", req, maxsplit=1)[0]))
+    return frozenset(names)
+
+
+def uninstall_blocker(engine_id: str) -> "tuple[int, str] | None":
+    """Why removing this engine's package would break something, or None.
+
+    `pip uninstall` acts on the app's own environment. A package VoiceStudio
+    depends on (openai, argostranslate) would break the app, and a package
+    other translation engines share (deep_translator backs four) would break
+    those engines too.
+    """
+    entry = REGISTRY.get(engine_id)
+    pkg = entry.get("pip_package") if entry else None
+    if not pkg:
+        return None
+    if _normalize(pkg) in _app_dependency_names():
+        return 400, (
+            f"{entry['display_name']} uses {pkg}, which VoiceStudio itself "
+            "depends on. Uninstalling it would break the app."
+        )
+    sharing = [
+        other["display_name"]
+        for other_id, other in REGISTRY.items()
+        if other_id != engine_id
+        and other.get("pip_package")
+        and _normalize(other["pip_package"]) == _normalize(pkg)
+    ]
+    if sharing:
+        return 409, (
+            f"{entry['display_name']} shares {pkg} with {', '.join(sharing)}. "
+            "Uninstalling it would stop those working too."
+        )
+    return None
 
 
 def get_engine(engine_id: str) -> dict | None:
@@ -177,6 +288,16 @@ async def run_pip(args: list[str], timeout: float = 600.0) -> tuple[int, str]:
     """
     base = _installer_cmd()
     using_uv = base[:1] == ["uv"]
+    # Pin `uv pip` to the interpreter the backend ACTUALLY runs under. The desktop
+    # spawns `<venv>/bin/python -m uvicorn` WITHOUT exporting VIRTUAL_ENV, so bare
+    # `uv pip install` finds no venv and 500s with "No virtual environment found"
+    # (#529/#527) — and the `--system` branch below never fires, because the
+    # running interpreter genuinely IS in a venv (uv just can't auto-discover it).
+    # `--python sys.executable` targets the same interpreter _probe()/is_installed()
+    # import from, and takes precedence when both flags are present, so the Docker
+    # `--system` path is unaffected.
+    if using_uv and args and args[0] in ("install", "uninstall") and "--python" not in args:
+        args = [args[0], "--python", sys.executable, *args[1:]]
     if using_uv and not _in_virtualenv() and args and args[0] in ("install", "uninstall") and "--system" not in args:
         args = [args[0], "--system", *args[1:]]
     cmd = base + args

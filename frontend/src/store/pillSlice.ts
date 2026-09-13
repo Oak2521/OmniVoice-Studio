@@ -11,7 +11,7 @@
  */
 import type { StateCreator } from 'zustand';
 
-export type PillStage =
+type PillStage =
   | 'idle'
   | 'loading-model'
   | 'recording'
@@ -23,7 +23,7 @@ export type PillStage =
   | 'done'
   | 'error';
 
-export interface PillState {
+interface PillState {
   /** Current stage of the pill */
   stage: PillStage;
   /** Human-readable label for the current stage (e.g. "Loading ASR model…") */
@@ -38,14 +38,26 @@ export interface PillState {
   visible: boolean;
   /** Whether the operation is cancellable */
   cancellable: boolean;
+  /**
+   * The workspace mode this operation "belongs to". When the user is already on
+   * that mode, an in-context progress view (e.g. the dub PrepOverlay) is showing
+   * the same thing, so the pill suppresses itself to avoid duplication. The pill
+   * reappears the moment they navigate elsewhere. null = always show.
+   */
+  homeMode: string | null;
 }
 
 export interface PillSlice extends PillState {
   /** Push a new pill state. Resets startedAt automatically. */
-  showPill: (stage: PillStage, label: string, opts?: {
-    progress?: number | null;
-    cancellable?: boolean;
-  }) => void;
+  showPill: (
+    stage: PillStage,
+    label: string,
+    opts?: {
+      progress?: number | null;
+      cancellable?: boolean;
+      homeMode?: string | null;
+    },
+  ) => void;
   /** Update progress without changing stage */
   setPillProgress: (progress: number | null) => void;
   /** Update label without changing stage */
@@ -66,20 +78,23 @@ const INITIAL: PillState = {
   error: null,
   visible: false,
   cancellable: false,
+  homeMode: null,
 };
 
 export const createPillSlice: StateCreator<PillSlice, [], [], PillSlice> = (set) => ({
   ...INITIAL,
 
-  showPill: (stage, label, opts) => set({
-    stage,
-    label,
-    progress: opts?.progress ?? null,
-    startedAt: Date.now(),
-    error: null,
-    visible: true,
-    cancellable: opts?.cancellable ?? false,
-  }),
+  showPill: (stage, label, opts) =>
+    set({
+      stage,
+      label,
+      progress: opts?.progress ?? null,
+      startedAt: Date.now(),
+      error: null,
+      visible: true,
+      cancellable: opts?.cancellable ?? false,
+      homeMode: opts?.homeMode ?? null,
+    }),
 
   setPillProgress: (progress) => set({ progress }),
   setPillLabel: (label) => set({ label }),
@@ -97,16 +112,17 @@ export const createPillSlice: StateCreator<PillSlice, [], [], PillSlice> = (set)
     });
     // Auto-dismiss after 3s
     setTimeout(() => {
-      set((s) => s.stage === 'done' ? INITIAL : s);
+      set((s) => (s.stage === 'done' ? INITIAL : s));
     }, 3000);
   },
 
-  errorPill: (error) => set({
-    stage: 'error',
-    label: 'Error',
-    progress: null,
-    error,
-    cancellable: false,
-    visible: true,
-  }),
+  errorPill: (error) =>
+    set({
+      stage: 'error',
+      label: 'Error',
+      progress: null,
+      error,
+      cancellable: false,
+      visible: true,
+    }),
 });

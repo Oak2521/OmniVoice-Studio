@@ -32,6 +32,7 @@ ERROR_DOCS: dict[str, str] = {
     # directly. Distinct from HF_AUTH_FAILED (which is the more general
     # token-missing-or-invalid case pointing at the token-setup doc).
     "PYANNOTE_LICENSE_REQUIRED":   f"{_BASE}/docs/features/diarization.md#license-acceptance-flow",
+    "POCKETTTS_GATED_WEIGHTS":     f"{_BASE}/docs/install/troubleshooting.md#pockettts-gated-weights",
 }
 
 DEFAULT_DOCS: str = f"{_BASE}/docs/install/troubleshooting.md"

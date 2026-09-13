@@ -22,11 +22,24 @@ cross-fading, and format conversion. Used by ``OmniVoice.generate()`` during
 inference post-processing.
 """
 
+import logging
+import math
+
 import numpy as np
 import torch
 import torchaudio
 from pydub import AudioSegment
 from pydub.silence import detect_leading_silence, detect_nonsilent, split_on_silence
+
+logger = logging.getLogger(__name__)
+
+# Machine-readable marker prefixed to the "reference clip has no usable audio"
+# ValueError so UI layers can recognize the class and show localized guidance
+# instead of the raw English detail (issue #1188). The frontend matches this
+# exact string (frontend/src/utils/errorToast.jsx) — change both or neither.
+CLONE_REF_UNUSABLE_MARKER = "[clone_ref_unusable]"
+CLONE_REF_TOO_LONG_MARKER = "[clone_ref_too_long]"
+CLONE_REF_NO_SPEECH_MARKER = "[clone_ref_no_speech]"
 
 
 def load_audio(audio_path: str, sampling_rate: int):
@@ -73,6 +86,7 @@ def remove_silence(
     mid_sil: int = 300,
     lead_sil: int = 100,
     trail_sil: int = 300,
+    silence_thresh: float = -50,
 ):
     """
     Remove middle silences longer than mid_sil ms, and edge silences longer than edge_sil ms
@@ -84,6 +98,9 @@ def remove_silence(
             if mid_sil <= 0, no middle silence will be removed.
         edge_sil: the duration of silences in the edge of audio to be removed in ms.
         trail_sil: the duration of added trailing silence in ms.
+        silence_thresh: dBFS level below which a window counts as silence.
+            The historical hardcoded value (-50) is the default; gentler
+            (more negative) values keep quieter audio.
 
     Returns:
         PyTorch tensor with shape (C, T), where C is number of channels
@@ -97,7 +114,7 @@ def remove_silence(
         non_silent_segs = split_on_silence(
             wave,
             min_silence_len=mid_sil,
-            silence_thresh=-50,
+            silence_thresh=silence_thresh,
             keep_silence=mid_sil,
             seek_step=10,
         )
@@ -108,10 +125,83 @@ def remove_silence(
             wave += seg
 
     # Remove silence longer than 0.1 seconds in the begining and ending of wave
-    wave = remove_silence_edges(wave, lead_sil, trail_sil, -50)
+    wave = remove_silence_edges(wave, lead_sil, trail_sil, silence_thresh)
 
     # Convert to PyTorch tensor
     return audiosegment_to_tensor(wave)
+
+
+def remove_silence_safe(
+    audio: torch.Tensor,
+    sampling_rate: int,
+    mid_sil: int = 300,
+    lead_sil: int = 100,
+    trail_sil: int = 300,
+    silence_threshs: tuple = (-50.0, -60.0, -70.0),
+    min_keep_s: float = 0.5,
+):
+    """Silence removal that can never consume the whole recording (issue #1188).
+
+    :func:`remove_silence` detects speech against a fixed dBFS threshold. A
+    quiet-but-real recording — laptop mic far from the speaker, low input
+    gain — can sit entirely below that threshold and be removed wholesale,
+    leaving an empty clip and a dead-end error downstream ("Reference audio is
+    empty after silence removal").
+
+    Retry ladder: try the standard threshold first, then progressively gentler
+    ones; accept the first result that keeps at least ``min_keep_s`` of audio
+    (or the full clip, when the input is already shorter than that). If every
+    rung still consumes (nearly) everything, skip trimming and return the input
+    unchanged — an untrimmed real recording always beats an empty one.
+
+    Same signature/semantics as :func:`remove_silence` otherwise; drop-in.
+    """
+    total = audio.size(-1)
+    if total == 0:
+        return audio
+    floor = max(1, min(int(min_keep_s * sampling_rate), total))
+    for thresh in silence_threshs:
+        trimmed = remove_silence(
+            audio, sampling_rate, mid_sil, lead_sil, trail_sil,
+            silence_thresh=thresh,
+        )
+        if trimmed.size(-1) >= floor:
+            if thresh != silence_threshs[0]:
+                logger.info(
+                    "Silence removal at %g dBFS would have removed nearly the "
+                    "whole clip (quiet recording); recovered with the gentler "
+                    "%g dBFS threshold.",
+                    silence_threshs[0], thresh,
+                )
+            return trimmed
+    logger.warning(
+        "Silence removal would have removed (nearly) the whole clip at every "
+        "threshold %s — the recording is very quiet. Skipping silence "
+        "removal and using the audio as-is.",
+        silence_threshs,
+    )
+    return audio
+
+
+def validate_clone_reference(ref_wav: torch.Tensor, ref_rms: float) -> None:
+    """Raise an actionable error when a voice-clone reference clip has no
+    usable audio at all (issue #1188).
+
+    Quiet-but-real clips are handled upstream by :func:`remove_silence_safe`
+    (gentler thresholds, then no trimming), so the only clips that reach a
+    hard failure are genuinely empty ones: zero samples, pure digital
+    silence, or non-finite garbage (NaN/inf samples make the RMS non-finite).
+    The message carries :data:`CLONE_REF_UNUSABLE_MARKER` so the UI can show
+    localized guidance, and tells API callers the concrete fix directly.
+    """
+    if ref_wav.size(-1) == 0 or not math.isfinite(ref_rms) or ref_rms <= 0.0:
+        raise ValueError(
+            f"{CLONE_REF_UNUSABLE_MARKER} Reference audio has no usable "
+            "sound — the clip is empty or completely silent, so there is no "
+            "voice to clone. Record again closer to the microphone (check "
+            "that the correct input device is selected and its level moves "
+            "while you speak), or choose a different reference clip."
+        )
 
 
 def remove_silence_edges(

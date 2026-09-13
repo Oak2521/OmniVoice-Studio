@@ -25,9 +25,13 @@
 # ──────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
+# Always run from the repo root — every path below is repo-root-relative
+# (#962 hardening, same as scripts/desktop-prod.sh).
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
 APP_ID="com.debpalash.omnivoice-studio"
 TAURI_DIR="frontend/src-tauri"
-APP_NAME="OmniVoice Studio"
+APP_NAME="VoiceStudio"
 BACKEND_URL="http://127.0.0.1:3900"
 
 # Timeouts (seconds)
@@ -86,7 +90,8 @@ elif [ "$PLATFORM" = "windows" ]; then
   HF_CACHE="${HF_HOME:-${LOCALAPPDATA}/OmniVoice/hf_cache}"
 else
   APP_DATA="${XDG_DATA_HOME:-$HOME/.local/share}/${APP_ID}"
-  OV_DATA="${XDG_DATA_HOME:-$HOME/.local/share}/OmniVoice"
+  # Linux: the backend uses ~/.omnivoice, NOT XDG (backend/core/config.py).
+  OV_DATA="$HOME/.omnivoice"
   HF_CACHE="${HF_HOME:-$HOME/.cache/huggingface}"
 fi
 
@@ -112,7 +117,7 @@ for arg in "$@"; do
 done
 
 # ══════════════════════════════════════════════════════════════════════════
-header "🧪 OmniVoice Studio — End-to-End Smoke Test"
+header "🧪 VoiceStudio — End-to-End Smoke Test"
 echo "   Platform: $PLATFORM | $(date)"
 echo ""
 
@@ -155,13 +160,15 @@ if [ "$SKIP_BUILD" = false ]; then
         [ -d "$APP_BUNDLE" ] && rm -rf "$APP_BUNDLE"
     fi
 
+    # #962: resolve the workspace-local Tauri CLI via the frontend package's
+    # `tauri` script — `bunx tauri` resolves by npm package name and can miss
+    # the workspace bin, then fetches the wrong npm package. Keep in sync
+    # with scripts/desktop-prod.sh.
     BUILD_LOG=$(mktemp)
-    cd frontend
     set +e
-    bunx tauri build --debug >"$BUILD_LOG" 2>&1
+    bun run --cwd frontend tauri build --debug >"$BUILD_LOG" 2>&1
     BUILD_EXIT=$?
     set -e
-    cd ..
 
     if [ $BUILD_EXIT -ne 0 ]; then
         if grep -qi "TAURI_SIGNING_PRIVATE_KEY\|private key\|failed to bundle" "$BUILD_LOG"; then

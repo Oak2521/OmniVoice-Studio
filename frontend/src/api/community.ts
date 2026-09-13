@@ -5,7 +5,7 @@
  */
 import { apiJson } from './client';
 
-export interface CommunityItem {
+interface CommunityItem {
   id: string;
   type: 'preset' | 'voice';
   name: string;
@@ -19,7 +19,9 @@ export interface CommunityItem {
   author?: string;
   license?: string;
   source?: string;
+  _source_repo?: string;
   is_community?: boolean;
+  attrs?: Record<string, string>;
 }
 
 export interface CommunityPage {
@@ -27,14 +29,6 @@ export interface CommunityPage {
   limit: number;
   offset: number;
   items: CommunityItem[];
-}
-
-export interface CommunityManifest {
-  sources: string[];
-  packs: any[];
-  items: CommunityItem[];
-  count: number;
-  offline: boolean;
 }
 
 export interface CommunityFilters {
@@ -57,15 +51,17 @@ export const listCommunityItems = (filters: CommunityFilters = {}): Promise<Comm
   return apiJson(`/community/items${q ? `?${q}` : ''}`);
 };
 
-export const communityManifest = (refresh = false): Promise<CommunityManifest> =>
-  apiJson(`/community/manifest?refresh=${refresh}`);
-
-export const communitySources = (): Promise<{ sources: string[] }> => apiJson('/community/sources');
-
 export const communitySubmitUrl = (type: 'preset' | 'voice'): Promise<{ url: string }> =>
   apiJson(`/community/submit-url?type=${type}`);
 
-export const addCommunityItem = (id: string, name?: string): Promise<{ profile_id: string; name: string }> => {
+export const addCommunityItem = (
+  id: string,
+  name?: string,
+): Promise<{ profile_id: string; name: string }> => {
   const q = name ? `?name=${encodeURIComponent(name)}` : '';
   return apiJson(`/community/items/${encodeURIComponent(id)}/use${q}`, { method: 'POST' });
 };
+
+/** Same-origin preview path for both designed presets and recorded voices. */
+export const communityPreviewUrl = (id: string, local = false): string =>
+  `/community/items/${encodeURIComponent(id)}/preview${local ? '?local=true' : ''}`;

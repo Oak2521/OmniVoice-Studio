@@ -66,6 +66,8 @@ internally — you can write in English, Chinese, or a mix of both.
 |---------|---------|
 | whisper | 耳语 |
 
+> `whisper` is the only delivery style the base model accepts — emotion tags like `[happy]`/`[sad]` are not part of this taxonomy. For everything expressive (breaths, laughter, pauses, emotion, and which engines support what), see [expressive-speech.md](expressive-speech.md).
+
 ### English Accent
 
 Only effective when the synthesis text is in English.
@@ -126,3 +128,7 @@ for Chinese — the model auto-fixes mismatches).
 - **Case-insensitive**: `"Male"`, `"MALE"`, and `"male"` are all accepted, the code will normalize them to lower case.
 
 - **Accent vs Dialect**: English accents are only applied to English speech, Chinese dialects are only applied to Chinese speech.
+
+Gallery previews reject silent output and near-pure tonal buzz. The quality
+check measures short audio frames rather than the whole clip, so longer or
+softly voiced speech is not rejected merely for having low spectral flatness.

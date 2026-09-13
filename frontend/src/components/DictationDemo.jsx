@@ -2,7 +2,7 @@
  * DictationDemo — guided walkthrough for the real-time dictation feature.
  *
  * What this surfaces:
- *   1. Active hotkey display (read from the dictation_shortcut Tauri command).
+ *   1. Active hotkey display (including a portal-selected Wayland shortcut).
  *   2. Three script cards — short utterances the user can read aloud OR
  *      replay from a bundled WAV. The replay path posts the bundled audio
  *      to POST /transcribe and renders the recognized text below the card
@@ -23,9 +23,17 @@
 import { useEffect, useRef, useState } from 'react';
 import { Play, Pause, Keyboard, Mic, CheckCircle2, AlertTriangle } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { API } from '../api/client';
+import { API, apiFetch } from '../api/client';
+import { asrMissingPayload, toastAsrModelMissing } from '../utils/asrModelMissing';
+import { useEffectiveDictationShortcut } from '../hooks/useEffectiveDictationShortcut';
+import { useDictationReadiness } from '../hooks/useDictationReadiness';
+import AsrModelChooser from './AsrModelChooser';
 import { Button } from '../ui';
-import './DictationDemo.css';
+
+// Shared status-pill base; per-state color/bg/border appended below. The gruvbox
+// status hues are intentionally preserved (palette kept) as arbitrary utilities.
+const STATUS_BASE =
+  'inline-flex items-center gap-[6px] text-[11px] px-[8px] py-[3px] rounded-[999px] border';
 
 const SCRIPTS = [
   {
@@ -57,8 +65,15 @@ function isTauri() {
 
 export default function DictationDemo({ embedded = false }) {
   const { t } = useTranslation();
-  const [shortcut, setShortcut] = useState('');
   const [hotkeyState, setHotkeyState] = useState('unknown'); // unknown | registered | verified
+  const desktop = isTauri();
+  const { info: shortcut } = useEffectiveDictationShortcut(desktop);
+  // Transcribing a sample needs a speech-to-text model, and the mandatory-only
+  // install path ships none. Rendering the cards regardless meant the final
+  // onboarding step opened with one hard error per card and invited the user
+  // to press a hotkey that could not work (#1856). Probed for the same reason
+  // the demo already probes for its sample WAVs below.
+  const readiness = useDictationReadiness();
   const [playingId, setPlayingId] = useState(null);
   const [transcripts, setTranscripts] = useState({}); // {scriptId: {state, text, error}}
   // null = probing, true/false once the demo assets are confirmed present.
@@ -72,30 +87,32 @@ export default function DictationDemo({ embedded = false }) {
   // demo if not, mirroring DubbingDemo's missing-manifest behavior.
   useEffect(() => {
     let cancelled = false;
-    fetch(`${API}${SCRIPTS[0].wav}`, { method: 'HEAD' })
-      .then((r) => { if (!cancelled) setAssetsAvailable(r.ok); })
-      .catch(() => { if (!cancelled) setAssetsAvailable(false); });
-    return () => { cancelled = true; };
+    apiFetch(`${API}${SCRIPTS[0].wav}`, { method: 'HEAD' })
+      .then(() => {
+        if (!cancelled) setAssetsAvailable(true);
+      })
+      .catch(() => {
+        if (!cancelled) setAssetsAvailable(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
-  // Read the registered hotkey on mount.
   useEffect(() => {
-    if (!isTauri()) return;
-    let cancelled = false;
-    (async () => {
-      try {
-        const { invoke } = await import('@tauri-apps/api/core');
-        const v = await invoke('get_dictation_shortcut');
-        if (!cancelled) {
-          setShortcut(v || '');
-          setHotkeyState(v ? 'registered' : 'unknown');
-        }
-      } catch {
-        if (!cancelled) setHotkeyState('unknown');
-      }
-    })();
-    return () => { cancelled = true; };
-  }, []);
+    if (!desktop) return;
+    // `unregistered` is its own state, not a flavour of `unknown`: the OS
+    // refused the accelerator, usually because another app already holds it
+    // (the default collides with 1Password Quick Access on macOS). Saying
+    // "no hotkey registered" there would read as "we have not checked yet",
+    // when what the user needs to know is that this specific combination is
+    // taken and they should pick another (#1858).
+    setHotkeyState((current) => {
+      if (shortcut.backend === 'unregistered') return 'unregistered';
+      if (current === 'verified') return current;
+      return shortcut.backend === 'focused' ? 'unknown' : 'registered';
+    });
+  }, [desktop, shortcut.backend]);
 
   // Subscribe to dictation events: the moment the user presses their
   // hotkey while this panel is mounted, flip to verified.
@@ -116,8 +133,16 @@ export default function DictationDemo({ embedded = false }) {
       }
     })();
     return () => {
-      try { unlistenStart && unlistenStart(); } catch { /* noop */ }
-      try { unlistenStop && unlistenStop(); } catch { /* noop */ }
+      try {
+        unlistenStart && unlistenStart();
+      } catch {
+        /* noop */
+      }
+      try {
+        unlistenStop && unlistenStop();
+      } catch {
+        /* noop */
+      }
     };
   }, []);
 
@@ -131,7 +156,8 @@ export default function DictationDemo({ embedded = false }) {
     }
     audio.src = `${API}${script.wav}`;
     audio.currentTime = 0;
-    audio.play()
+    audio
+      .play()
       .then(() => setPlayingId(script.id))
       .catch((e) => {
         console.warn('Sample playback failed:', e);
@@ -148,25 +174,29 @@ export default function DictationDemo({ embedded = false }) {
       [script.id]: { state: 'loading', text: '', error: '' },
     }));
     try {
-      const wavRes = await fetch(`${API}${script.wav}`);
-      if (!wavRes.ok) throw new Error(`Could not fetch sample: ${wavRes.status}`);
+      const wavRes = await apiFetch(`${API}${script.wav}`);
       const blob = await wavRes.blob();
       const fd = new FormData();
       fd.append('audio', blob, `${script.id}.wav`);
-      const tRes = await fetch(`${API}/transcribe`, { method: 'POST', body: fd });
-      if (!tRes.ok) {
-        const errBody = await tRes.text().catch(() => '');
-        throw new Error(`Transcribe failed (${tRes.status}): ${errBody.slice(0, 120)}`);
-      }
+      const tRes = await apiFetch(`${API}/transcribe`, { method: 'POST', body: fd });
       const json = await tRes.json();
       setTranscripts((prev) => ({
         ...prev,
         [script.id]: { state: 'ok', text: json.text || '', error: '' },
       }));
     } catch (e) {
+      // Typed 409 on a TTS-only install: no ASR model on disk. Render the
+      // human message + the one-click download CTA instead of the raw
+      // "409 Conflict: …" string.
+      const missing = asrMissingPayload(e);
+      if (missing) toastAsrModelMissing(missing);
       setTranscripts((prev) => ({
         ...prev,
-        [script.id]: { state: 'fail', text: '', error: e?.message || String(e) },
+        [script.id]: {
+          state: 'fail',
+          text: '',
+          error: missing ? t('asr_missing.message') : e?.message || String(e),
+        },
       }));
     }
   };
@@ -175,87 +205,161 @@ export default function DictationDemo({ embedded = false }) {
     switch (hotkeyState) {
       case 'verified':
         return (
-          <span className="dictation-demo__status dictation-demo__status--ok">
+          <span
+            className={`${STATUS_BASE} border-transparent bg-[rgba(152,151,26,0.12)] text-[#b8bb26]`}
+          >
             <CheckCircle2 size={12} /> {t('demo.dictation_status_ok')}
+          </span>
+        );
+      case 'unregistered':
+        return (
+          <span
+            className={`${STATUS_BASE} border-transparent bg-[rgba(204,36,29,0.12)] text-[#fb4934]`}
+          >
+            <AlertTriangle size={12} />{' '}
+            {t('demo.dictation_status_taken', {
+              defaultValue:
+                'Another app already uses this shortcut — pick a different one in Settings.',
+            })}{' '}
+            <code className="font-mono text-[10px] px-[4px] py-[1px] bg-[rgba(0,0,0,0.3)] rounded-[3px]">
+              {shortcut.display}
+            </code>
           </span>
         );
       case 'registered':
         return (
-          <span className="dictation-demo__status dictation-demo__status--pending">
-            <Keyboard size={12} /> {t('demo.dictation_status_pending')} <code>{shortcut}</code>
+          <span
+            className={`${STATUS_BASE} border-transparent bg-[rgba(215,153,33,0.10)] text-[#fabd2f]`}
+          >
+            <Keyboard size={12} /> {t('demo.dictation_status_pending')}{' '}
+            <code className="font-mono text-[10px] px-[4px] py-[1px] bg-[rgba(0,0,0,0.3)] rounded-[3px]">
+              {shortcut.display}
+            </code>
           </span>
         );
       default:
         return (
-          <span className="dictation-demo__status dictation-demo__status--warn">
+          <span
+            className={`${STATUS_BASE} border-transparent bg-[rgba(204,36,29,0.10)] text-[#fb4934]`}
+          >
             <AlertTriangle size={12} /> {t('demo.dictation_status_warn')}
           </span>
         );
     }
   })();
 
-  // No bundled samples on disk → don't render a demo that can't work.
-  if (assetsAvailable === false) return null;
+  // The hotkey card always has something real to teach (the registered
+  // shortcut + live press-to-verify) — only the replayable script cards
+  // depend on the bundled WAVs, which installs don't always ship. Hiding
+  // the whole panel left the wizard's "Try dictation" act completely
+  // blank on every such install (#119/#124 follow-up, refined).
+  // `checking` still shows the cards: the probe resolves in well under a
+  // second and flashing the install panel first would be worse than a brief
+  // wait. Only a confirmed-missing model swaps them out.
+  const asrMissing = readiness.phase === 'missing';
+  const showScripts = assetsAvailable !== false && !asrMissing;
 
   return (
-    <section className={`dictation-demo ${embedded ? 'dictation-demo--embedded' : ''}`}>
-      <header className="dictation-demo__head">
-        <h3 className="dictation-demo__title">
+    <section
+      className={`dictation-demo flex flex-col gap-[10px] ${
+        embedded
+          ? 'mb-[12px]'
+          : 'p-[14px] rounded-[10px] border border-border bg-[rgba(255,255,255,0.02)] mb-[16px]'
+      }`}
+    >
+      <header className="flex items-center justify-between gap-[12px] flex-wrap">
+        <h3 className="inline-flex items-center gap-[6px] m-0 text-[13px] font-bold text-fg">
           <Mic size={14} /> {t('demo.dictation_title')}
         </h3>
         {statusBadge}
       </header>
 
-      <p className="dictation-demo__lede">{t('demo.dictation_lede')}</p>
+      <p className="m-0 text-[11px] leading-[1.45] text-fg-muted">
+        {showScripts
+          ? t('demo.dictation_lede')
+          : t(
+              'demo.dictation_lede_hotkey_only',
+              'Hold the shortcut above anywhere on your desktop, speak, release — the text lands in whatever app has focus. Press it now to verify it works.',
+            )}
+      </p>
 
       <audio ref={audioRef} onEnded={() => setPlayingId(null)} preload="none" />
 
-      <div className="dictation-demo__scripts">
-        {SCRIPTS.map((s) => {
-          const isPlaying = playingId === s.id;
-          const tx = transcripts[s.id] || {};
-          return (
-            <div key={s.id} className="dictation-demo__card">
-              <div className="dictation-demo__card-head">
-                <span className="dictation-demo__lang">{s.language}</span>
-                <span className="dictation-demo__card-label">{t(s.labelKey)}</span>
-              </div>
-              <blockquote className="dictation-demo__script">{s.text}</blockquote>
-              <div className="dictation-demo__card-actions">
-                <Button
-                  size="sm"
-                  variant="subtle"
-                  onClick={() => togglePlay(s)}
-                  leading={isPlaying ? <Pause size={11} /> : <Play size={11} />}
-                  aria-label={isPlaying ? t('demo.aria_pause', { label: t(s.labelKey) }) : t('demo.aria_hear', { label: t(s.labelKey) })}
-                >
-                  {isPlaying ? t('demo.dictation_stop') : t('demo.dictation_hear')}
-                </Button>
-                <Button
-                  size="sm"
-                  variant="subtle"
-                  onClick={() => replay(s)}
-                  loading={tx.state === 'loading'}
-                  leading={tx.state !== 'loading' && <Mic size={11} />}
-                  aria-label={t('demo.aria_replay', { label: t(s.labelKey) })}
-                >
-                  {tx.state === 'loading' ? t('demo.dictation_transcribing') : t('demo.dictation_replay')}
-                </Button>
-              </div>
-              {tx.state === 'ok' && (
-                <div className="dictation-demo__result dictation-demo__result--ok">
-                  <CheckCircle2 size={11} /> <em>{tx.text}</em>
+      {asrMissing && (
+        <div className="flex flex-col gap-2 rounded-[8px] border border-border bg-[rgba(0,0,0,0.15)] px-[12px] py-[10px]">
+          <p className="m-0 text-[11px] leading-[1.45] text-fg-muted">{t('asr_missing.message')}</p>
+          <AsrModelChooser
+            fallback={readiness.missing?.recommended}
+            onInstall={readiness.install}
+            onSelect={readiness.select}
+            disabled={readiness.phase === 'installing'}
+          />
+        </div>
+      )}
+
+      {showScripts && (
+        <div className="dictation-demo__scripts grid grid-cols-[repeat(auto-fill,minmax(260px,1fr))] gap-[10px]">
+          {SCRIPTS.map((s) => {
+            const isPlaying = playingId === s.id;
+            const tx = transcripts[s.id] || {};
+            return (
+              <div
+                key={s.id}
+                className="flex flex-col gap-[6px] px-[12px] py-[10px] rounded-[8px] border border-border bg-[rgba(0,0,0,0.15)]"
+              >
+                <div className="flex items-center gap-[8px] text-[10px] text-fg-muted">
+                  <span className="font-mono text-[9px] px-[5px] py-[1px] rounded-sm bg-[rgba(255,255,255,0.06)] uppercase tracking-[0.04em]">
+                    {s.language}
+                  </span>
+                  <span className="font-semibold text-[11px] text-fg normal-case">
+                    {t(s.labelKey)}
+                  </span>
                 </div>
-              )}
-              {tx.state === 'fail' && (
-                <div className="dictation-demo__result dictation-demo__result--fail">
-                  <AlertTriangle size={11} /> {tx.error}
+                <blockquote className="m-0 px-[8px] py-[6px] text-[11.5px] leading-[1.45] border-l-2 border-l-transparent bg-[rgba(255,255,255,0.02)] text-fg italic">
+                  {s.text}
+                </blockquote>
+                <div className="flex gap-[6px] mt-[2px]">
+                  <Button
+                    size="sm"
+                    variant="subtle"
+                    onClick={() => togglePlay(s)}
+                    leading={isPlaying ? <Pause size={11} /> : <Play size={11} />}
+                    aria-label={
+                      isPlaying
+                        ? t('demo.aria_pause', { label: t(s.labelKey) })
+                        : t('demo.aria_hear', { label: t(s.labelKey) })
+                    }
+                  >
+                    {isPlaying ? t('demo.dictation_stop') : t('demo.dictation_hear')}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="subtle"
+                    onClick={() => replay(s)}
+                    loading={tx.state === 'loading'}
+                    leading={tx.state !== 'loading' && <Mic size={11} />}
+                    aria-label={t('demo.aria_replay', { label: t(s.labelKey) })}
+                  >
+                    {tx.state === 'loading'
+                      ? t('demo.dictation_transcribing')
+                      : t('demo.dictation_replay')}
+                  </Button>
                 </div>
-              )}
-            </div>
-          );
-        })}
-      </div>
+                {tx.state === 'ok' && (
+                  <div className="flex items-start gap-[6px] text-[11px] px-[8px] py-[6px] rounded-lg leading-[1.4] text-[#b8bb26] bg-[rgba(152,151,26,0.08)] border border-transparent">
+                    <CheckCircle2 size={11} /> <em className="not-italic">{tx.text}</em>
+                  </div>
+                )}
+                {tx.state === 'fail' && (
+                  <div className="flex items-start gap-[6px] text-[11px] px-[8px] py-[6px] rounded-lg leading-[1.4] text-[#fb4934] bg-[rgba(204,36,29,0.08)] border border-transparent">
+                    <AlertTriangle size={11} /> {tx.error}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
     </section>
   );
 }

@@ -13,7 +13,8 @@ What's here
 * **Content-hash cache lookup** — `compute_file_hash`, `find_cached_job`.
 * **Safe path resolution** — `safe_job_dir`.
 * **Process lifecycle** — ffmpeg/demucs subprocess tracking + `kill_job_procs`
-  so `POST /dub/abort/{id}` can tear down in-flight work.
+  so `POST /dub/abort/{id}` can tear down in-flight work (implemented in
+  `services.proc_registry`, re-exported here for compatibility).
 * **SSE helpers** — `sse_event`, `prep_event`.
 
 What stays in the router
@@ -36,6 +37,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import OrderedDict
 from typing import AsyncIterator, Optional
 
 import soundfile as sf
@@ -44,9 +46,21 @@ from core.config import DUB_DIR
 from fastapi import HTTPException
 from services.ffmpeg_utils import find_ffmpeg, find_ffprobe, _get_semaphore, _spawn_with_retry
 from services.model_manager import get_best_device
+# Process lifecycle moved to its own leaf module so ffmpeg_utils can import
+# it at module top (no dub_pipeline ↔ ffmpeg_utils cycle). Re-exported here —
+# dub_core and tests still alias these names through this module.
+from services.proc_registry import (  # noqa: F401 — re-exports
+    _active_procs,
+    _active_procs_lock,
+    has_active_procs,
+    kill_job_procs,
+    register_proc,
+    unregister_proc,
+)
 from core.db import db_conn
 from core import event_bus
 from core import failure
+from core.logging_utils import log_safe
 
 logger = logging.getLogger("omnivoice.dub_pipeline")
 
@@ -55,9 +69,45 @@ logger = logging.getLogger("omnivoice.dub_pipeline")
 # backward compat during the transition.
 
 _dub_jobs: dict[str, dict] = {}
-_dub_jobs_lock = threading.Lock()
-_active_procs: dict[str, list] = {}
-_active_procs_lock = threading.Lock()
+# Re-entrant: `save_job` takes this lock itself (see below), and the atomic
+# helpers call it while already holding it.
+_dub_jobs_lock = threading.RLock()
+
+#: Ingests currently running. Used only so "clear history" can also sweep a job
+#: that has no row yet — it would appear in no id list otherwise.
+_inflight_jobs: set[str] = set()
+
+#: Recently-deleted job ids, most-recent last. Guarded by ``_dub_jobs_lock``.
+#:
+#: Dict membership alone cannot express "the user withdrew this job" (#1252
+#: review): a job's FIRST persistence creates the entry, so an absent key means
+#: "not written yet" for a new job and "deleted" for an established one — two
+#: opposite instructions from one signal.
+#:
+#: Scoped to DELETED, not to in-flight ingests. Scoping it to ingests looked
+#: right and closed nothing that mattered: a dub is imported once and rendered
+#: many times, so the realistic delete lands during a RENDER, long after its
+#: ingest ended — and a render's save would then write the row straight back.
+#:
+#: Retained rather than cleared on completion, because there is no moment at
+#: which a delete stops mattering: any operation still holding that job can
+#: persist it. ``begin_ingest`` drops an id explicitly, since re-importing is a
+#: deliberate revival.
+#:
+#: Expired by AGE, not by count. A count-bounded LRU is evictable by ordinary
+#: use: ``DELETE /dub/history`` purges every row with no limit, so a user
+#: clearing a large history mid-render would push the rendering job's own
+#: marker out and the render would then write it back (#1252 review). Age
+#: cannot be gamed that way — what matters is how long ago the delete happened,
+#: not how many others followed it.
+#:
+#: The count cap is a memory backstop only, set far above any real history:
+#: ~4096 short ids is a few hundred KB. Reaching it needs 4096 deletions inside
+#: one TTL window, at which point the oldest markers are the least likely to
+#: still be held.
+_WITHDRAWN_TTL_S = 6 * 3600   # outlives any realistic render or transcribe
+_WITHDRAWN_MAX = 4096         # memory backstop, not the eviction policy
+_withdrawn_jobs: "OrderedDict[str, float]" = OrderedDict()
 
 _DUB_DIR_REAL = os.path.realpath(DUB_DIR)
 _HASH_BUF_SIZE = 1 << 18  # 256 KB chunks for hashing
@@ -86,6 +136,45 @@ def safe_job_dir(job_id: str) -> Optional[str]:
     if not candidate.startswith(_DUB_DIR_REAL + os.sep):
         return None
     return candidate
+
+
+def job_dir_referenced_by_others(job_id: str) -> "list[str]":
+    """History ids of OTHER jobs whose persisted paths point into ``job_id``'s
+    directory (#1331, the deletion half).
+
+    The content-hash cache legitimately points a newer job's ``vocals_path``
+    (and, for jobs created before the job-scoped-clones fix, its clone
+    reference paths) into an older job's directory. Deleting that older entry
+    used to ``rmtree`` the dir regardless, silently breaking the newer job:
+    single-segment regens fell back to the default voice, stems exports lost
+    their sources. The caller uses this to keep the DIRECTORY while still
+    deleting the history row — disk is the cheap thing here; another job's
+    voice is not.
+
+    Scans persisted ``job_data`` as text for the dir prefix rather than
+    enumerating every path-bearing key: keys have grown before (vocals,
+    no_vocals, thumb, clone refs, segment refs) and a scan cannot fall behind
+    the schema.
+    """
+    target = safe_job_dir(job_id)
+    if not target:
+        return []
+    needle = target.rstrip(os.sep) + os.sep
+    # JSON-encoded job_data escapes backslashes, so match the Windows form too.
+    needle_json = needle.replace("\\", "\\\\")
+    holders: list[str] = []
+    try:
+        with db_conn() as conn:
+            rows = conn.execute(
+                "SELECT id, job_data FROM dub_history WHERE id != ?", (job_id,)
+            ).fetchall()
+    except Exception:
+        return []  # no DB, nothing persisted can reference us
+    for row in rows:
+        data = row["job_data"] or ""
+        if needle in data or needle_json in data:
+            holders.append(row["id"])
+    return holders
 
 
 def sse_event(event: str, payload) -> bytes:
@@ -125,6 +214,19 @@ def find_cached_job(content_hash: str, exclude_job_id: str) -> Optional[dict]:
         vocals = job.get("vocals_path") or os.path.join(cached_dir, "vocals.wav")
         if not os.path.isfile(vocals):
             continue
+        # Separation-quality gate: stems produced before the HQ-extraction
+        # change were separated from the 16 kHz MONO ASR file — a mono,
+        # 8 kHz-ceiling music bed. audio_hq.wav in the cached job dir is the
+        # marker that its stems came from the full-quality stereo extraction;
+        # without it, reusing the cache would silently keep serving the
+        # narrow-band mono bed forever for that video. Re-separating once is
+        # the better deal.
+        if not os.path.isfile(os.path.join(cached_dir, "audio_hq.wav")):
+            logger.info(
+                "cache candidate %s has pre-HQ (mono/16k-derived) stems — "
+                "skipping reuse so separation reruns at full quality", row["id"],
+            )
+            continue
         return {
             "job_dir": cached_dir,
             "job_id": row["id"],
@@ -138,42 +240,8 @@ def find_cached_job(content_hash: str, exclude_job_id: str) -> Optional[dict]:
 
 
 # ── Process lifecycle ───────────────────────────────────────────────────────
-
-
-def register_proc(job_id: str, proc) -> None:
-    """Track an in-flight subprocess so /dub/abort can kill it."""
-    with _active_procs_lock:
-        _active_procs.setdefault(job_id, []).append(proc)
-
-
-def unregister_proc(job_id: str, proc) -> None:
-    with _active_procs_lock:
-        lst = _active_procs.get(job_id)
-        if lst and proc in lst:
-            lst.remove(proc)
-        if lst is not None and not lst:
-            _active_procs.pop(job_id, None)
-
-
-def kill_job_procs(job_id: str) -> None:
-    """Kill every subprocess still running under a given job id. Idempotent."""
-    with _active_procs_lock:
-        procs = list(_active_procs.get(job_id, []))
-    for proc in procs:
-        try:
-            if proc.returncode is None:
-                proc.kill()
-        except ProcessLookupError:
-            pass
-        except Exception as e:
-            logger.warning("Failed to kill subprocess for %s: %s", job_id, e)
-    with _active_procs_lock:
-        _active_procs.pop(job_id, None)
-
-
-def has_active_procs(job_id: str) -> bool:
-    with _active_procs_lock:
-        return bool(_active_procs.get(job_id))
+# register_proc / unregister_proc / kill_job_procs / has_active_procs live in
+# services.proc_registry (imported + re-exported above).
 
 
 # ── Job state (in-memory + SQLite fallback) ────────────────────────────────
@@ -194,8 +262,11 @@ def get_job(job_id: str) -> Optional[dict]:
             with _dub_jobs_lock:
                 _dub_jobs[job_id] = job
             return job
-        except json.JSONDecodeError as e:
-            logger.error("Failed to decode dub_history.job_data for %s: %s", job_id, e)
+        except json.JSONDecodeError:
+            # job_id arrives from request paths — strip newlines so a crafted
+            # id can't forge extra log lines (py/log-injection).
+            safe_id = str(job_id).replace("\r", "").replace("\n", "")
+            logger.exception("Failed to decode dub_history.job_data for %s", safe_id)
     return None
 
 
@@ -205,10 +276,190 @@ def put_job(job_id: str, job: dict) -> None:
         _dub_jobs[job_id] = job
 
 
+def merge_job(job_id: str, updates: dict) -> bool:
+    """Merge *updates* into an existing in-memory job. Does NOT persist.
+
+    Returns ``False`` when the job is gone — which is a real, reachable state,
+    not a defensive nicety: ingest runs for minutes (demucs, scene detection,
+    thumbnailing) and ``DELETE /dub/history/{id}`` pops the entry out from
+    under it. The pipeline used to finish with a bare
+    ``_dub_jobs[job_id].update(...)``, so deleting an in-flight dub surfaced as
+    the toast ``ingest: 'mgw39lx3'`` — ``str(KeyError)`` is the repr of the
+    key, nothing more (#1252/#1253). Callers treat ``False`` as "the user
+    withdrew this job" and stop, rather than resurrecting a record that was
+    deliberately deleted.
+    """
+    with _dub_jobs_lock:
+        job = _dub_jobs.get(job_id)
+        if job is None:
+            return False
+        job.update(updates)
+        return True
+
+
+def _expire_withdrawn(now: float, protected: int = 0) -> None:
+    """Drop withdrawal markers that are too old to still matter.
+
+    Caller must hold ``_dub_jobs_lock``. Age first — that is the policy — then
+    a size cap purely so the mapping cannot grow without bound.
+
+    ``protected`` is how many markers the current purge just recorded. Those sit
+    at the end (newest) and are never evicted by the size cap: they are the most
+    likely to still be held by a running job, and dropping one is exactly the
+    resurrection this whole mechanism exists to prevent. A single "clear
+    history" larger than the cap would otherwise force us to discard live
+    markers — which is what broke CI. The bound therefore is
+    ``cap + one purge``, not ``cap``.
+    """
+    cutoff = now - _WITHDRAWN_TTL_S
+    while _withdrawn_jobs:
+        _, deleted_at = next(iter(_withdrawn_jobs.items()))
+        if deleted_at >= cutoff:
+            break
+        _withdrawn_jobs.popitem(last=False)
+    floor = max(_WITHDRAWN_MAX, protected)
+    while len(_withdrawn_jobs) > floor:
+        _withdrawn_jobs.popitem(last=False)
+
+
+def begin_ingest(job_id: str) -> None:
+    """Mark an ingest as running.
+
+    Re-importing an id is a deliberate revival, so this clears any tombstone —
+    the only thing that legitimately un-deletes a job.
+    """
+    with _dub_jobs_lock:
+        _inflight_jobs.add(job_id)
+        _withdrawn_jobs.pop(job_id, None)
+
+
+def end_ingest(job_id: str) -> None:
+    """Mark an ingest as finished, however it ended.
+
+    Deliberately does NOT clear the tombstone: the ingest ending is not the
+    user un-deleting anything, and a render started before the delete can still
+    be holding that job.
+    """
+    with _dub_jobs_lock:
+        _inflight_jobs.discard(job_id)
+
+
+def put_and_save_job(
+    job_id: str,
+    job: dict,
+    *,
+    filename: str = "",
+    duration: float = 0.0,
+    content_hash: str = "",
+) -> bool:
+    """:func:`put_job` and :func:`save_job` as ONE atomic step.
+
+    Returns ``False`` when the job was withdrawn — the user deleted or cleared
+    its history while this ingest was running — in which case nothing is
+    written. Gating on the tombstone rather than on dict membership is what
+    makes this correct for a job's FIRST write, where an absent key is normal
+    (#1252 review).
+    """
+    with _dub_jobs_lock:
+        if job_id in _withdrawn_jobs:
+            return False
+        _dub_jobs[job_id] = job
+        save_job(job_id, job, filename, duration, content_hash)
+        return True
+
+
+def merge_and_save_job(
+    job_id: str,
+    updates: dict,
+    *,
+    filename: str = "",
+    duration: float = 0.0,
+    content_hash: str = "",
+) -> bool:
+    """:func:`merge_job` and :func:`save_job` as ONE atomic step.
+
+    Splitting them leaves a window that resurrects deleted work (#1252 review):
+    merge succeeds, the user deletes the dub — removing the row *and* the
+    in-memory entry — and the pending ``save_job`` then UPSERTs the row straight
+    back, so a dub the user deleted reappears in history. The delete endpoints
+    take this same lock around their own row-delete + evict, so the two
+    sequences cannot interleave at all.
+
+    Returns ``False`` when the job is already gone; the caller stops there.
+
+    The ``save_job`` write happens INSIDE the lock deliberately. That serialises
+    dub job-state access against one SQLite UPSERT — normally microseconds under
+    WAL, but up to sqlite3's 5 s default busy timeout if another writer is
+    holding the write lock. The alternative — releasing the lock before the
+    write — is the resurrection race this exists to close, so a rare latency
+    blip is the better trade. No locked region here calls another locked
+    function, so the plain (non-reentrant) ``_dub_jobs_lock`` cannot deadlock.
+    """
+    with _dub_jobs_lock:
+        job = _dub_jobs.get(job_id)
+        if job is None or job_id in _withdrawn_jobs:
+            return False
+        job.update(updates)
+        save_job(job_id, job, filename, duration, content_hash)
+        return True
+
+
+def purge_jobs(job_ids, *, delete_rows, include_inflight: bool = False) -> None:
+    """Delete history rows and evict the in-memory records as ONE atomic step.
+
+    ``delete_rows`` is called with the lock held, so a concurrent
+    :func:`merge_and_save_job` cannot slip between the row-delete and the
+    evict and write the job straight back (#1252 review). Both delete
+    endpoints go through here; ``DELETE /dub/history`` previously never evicted
+    from memory at all, so an in-flight job survived "clear history" entirely
+    and re-saved itself on completion.
+    """
+    with _dub_jobs_lock:
+        delete_rows()
+        # Deterministic order, de-duplicated. A `set` here made which markers
+        # the size cap evicts depend on PYTHONHASHSEED — the test for this very
+        # behaviour passed locally and failed in CI for that reason alone.
+        targets = list(dict.fromkeys(job_ids))
+        if include_inflight:
+            # "Clear history" means everything, including a job whose first row
+            # hasn't been written yet — it wouldn't appear in `job_ids` at all.
+            targets += [j for j in sorted(_inflight_jobs) if j not in set(targets)]
+        now = time.monotonic()
+        for job_id in targets:
+            _dub_jobs.pop(job_id, None)
+            _withdrawn_jobs.pop(job_id, None)
+            _withdrawn_jobs[job_id] = now  # most-recent last
+        _expire_withdrawn(now, protected=len(targets))
+
+
 def save_job(job_id: str, job: dict, filename: str = "", duration: float = 0.0, content_hash: str = "") -> None:
     """Persist dub job state to SQLite so it survives restarts. Uses UPSERT
     on `id` so repeated saves in a session keep the latest snapshot.
+
+    language / language_code / content_hash only update when the incoming
+    value is non-empty: the ingest-time insert runs before the target
+    language is known (both columns ""), generation sets them on the job
+    dict, and a later save from a job that lost them (e.g. hydrated from an
+    old row) must not clobber the healed columns back to "". The frontend
+    keys history restore off language_code, so a frozen "" hid finished
+    tracks until the user re-picked a language.
     """
+    with _dub_jobs_lock:
+        # The withdrawal gate lives HERE, not in the callers (#1252 review).
+        # Eight call sites across generate / translate / export / core persist
+        # jobs directly, so gating only the ingest helpers left every
+        # post-ingest save able to resurrect a dub the user deleted mid-render.
+        # One choke point closes the class and the ninth caller inherits it.
+        if job_id in _withdrawn_jobs:
+            logger.info(
+                "Dub job %s was deleted while it was still running — not persisting", log_safe(job_id),
+            )
+            return
+        _persist_job(job_id, job, filename, duration, content_hash)
+
+
+def _persist_job(job_id: str, job: dict, filename: str, duration: float, content_hash: str) -> None:
+    """The actual write. Callers go through :func:`save_job`, which gates it."""
     try:
         segments = job.get("segments") or []
         tracks = list((job.get("dubbed_tracks") or {}).keys())
@@ -221,6 +472,8 @@ def save_job(job_id: str, job: dict, filename: str = "", duration: float = 0.0, 
                      filename=excluded.filename,
                      duration=excluded.duration,
                      segments_count=excluded.segments_count,
+                     language=CASE WHEN excluded.language != '' THEN excluded.language ELSE dub_history.language END,
+                     language_code=CASE WHEN excluded.language_code != '' THEN excluded.language_code ELSE dub_history.language_code END,
                      tracks=excluded.tracks,
                      job_data=excluded.job_data,
                      content_hash=CASE WHEN excluded.content_hash != '' THEN excluded.content_hash ELSE dub_history.content_hash END""",
@@ -229,8 +482,8 @@ def save_job(job_id: str, job: dict, filename: str = "", duration: float = 0.0, 
                  len(segments), job.get("language", ""), job.get("language_code", ""),
                  json.dumps(tracks), json.dumps(job, default=str), content_hash or "", time.time()),
             )
-    except Exception as e:
-        logger.error("Failed to persist dub job %s: %s", job_id, e)
+    except Exception as exc:
+        logger.error("Failed to persist dub job %s: %s", log_safe(job_id), log_safe(exc))
         return
     event_bus.emit("dub_history", {"action": "saved", "id": job_id})
 
@@ -307,10 +560,24 @@ async def run_proc_streaming_stderr(
         stderr_parts: list[bytes] = []
         rc: int = -1
         try:
-            buf = b""
-            start = time.monotonic()
-            while True:
-                if time.monotonic() - start > timeout:
+            if getattr(p, "uses_sync_pipes", False):
+                # Fallback loops (the Windows SelectorEventLoop uvicorn forces
+                # under --reload) hand back a thread-backed proc whose .stderr is
+                # a plain SYNC pipe, not an asyncio StreamReader — `await
+                # p.stderr.read()` there raises "a coroutine or an awaitable is
+                # required" and crashed the demucs step. We can't stream that
+                # pipe incrementally without leaking blocked executor threads on
+                # every 1s poll, so run to completion via the wrapper's async
+                # communicate() and replay stderr as the same line events. No
+                # live progress on that degraded loop, but the subprocess still
+                # runs and the emitted event sequence is identical. The native
+                # async path (Proactor/posix — every release build) is the
+                # unchanged `else` below.
+                try:
+                    _out, err_bytes = await asyncio.wait_for(
+                        p.communicate(), timeout=timeout
+                    )
+                except asyncio.TimeoutError:
                     try:
                         p.kill()
                     except ProcessLookupError:
@@ -319,31 +586,50 @@ async def run_proc_streaming_stderr(
                         status_code=504,
                         detail=f"subprocess timed out after {timeout}s",
                     )
-                try:
-                    chunk = await asyncio.wait_for(p.stderr.read(256), timeout=1.0)
-                except asyncio.TimeoutError:
-                    if p.returncode is not None:
-                        break
-                    continue
-                if not chunk:
-                    break
-                stderr_parts.append(chunk)
-                buf += chunk
+                err_bytes = err_bytes or b""
+                stderr_parts.append(err_bytes)
+                for _line in re.split(rb"[\r\n]", err_bytes):
+                    _text = _line.decode(errors="replace")
+                    if _text.strip():
+                        yield ("stderr", _text)
+            else:
+                buf = b""
+                start = time.monotonic()
                 while True:
-                    idx_r = buf.find(b"\r")
-                    idx_n = buf.find(b"\n")
-                    if idx_r < 0 and idx_n < 0:
+                    if time.monotonic() - start > timeout:
+                        try:
+                            p.kill()
+                        except ProcessLookupError:
+                            pass
+                        raise HTTPException(
+                            status_code=504,
+                            detail=f"subprocess timed out after {timeout}s",
+                        )
+                    try:
+                        chunk = await asyncio.wait_for(p.stderr.read(256), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        if p.returncode is not None:
+                            break
+                        continue
+                    if not chunk:
                         break
-                    if idx_r < 0:
-                        idx = idx_n
-                    elif idx_n < 0:
-                        idx = idx_r
-                    else:
-                        idx = min(idx_r, idx_n)
-                    line = buf[:idx].decode(errors="replace")
-                    buf = buf[idx + 1:]
-                    if line.strip():
-                        yield ("stderr", line)
+                    stderr_parts.append(chunk)
+                    buf += chunk
+                    while True:
+                        idx_r = buf.find(b"\r")
+                        idx_n = buf.find(b"\n")
+                        if idx_r < 0 and idx_n < 0:
+                            break
+                        if idx_r < 0:
+                            idx = idx_n
+                        elif idx_n < 0:
+                            idx = idx_r
+                        else:
+                            idx = min(idx_r, idx_n)
+                        line = buf[:idx].decode(errors="replace")
+                        buf = buf[idx + 1:]
+                        if line.strip():
+                            yield ("stderr", line)
             rc = await p.wait()
         finally:
             unregister_proc(job_id, p)
@@ -451,9 +737,191 @@ def _ensure_browser_playable_mp4(video_path: str) -> str:
         logger.warning(
             "Could not transcode %s to browser-playable mp4 — the in-app "
             "video player may render this file as a black box.",
-            video_path,
+            log_safe(video_path),
         )
     return video_path
+
+
+async def _ensure_browser_playable_mp4_for_job(job_id: str, video_path: str) -> str:
+    """Normalize an upload through the job's cancellable process registry."""
+    is_mp4 = video_path.lower().endswith(".mp4")
+    vcodec, acodec = await asyncio.to_thread(_probe_codecs, video_path)
+    if is_mp4 and vcodec in _BROWSER_VIDEO_CODECS and acodec in _BROWSER_AUDIO_CODECS:
+        return video_path
+
+    target = os.path.splitext(video_path)[0] + ".mp4"
+    if target == video_path:
+        target = os.path.splitext(video_path)[0] + ".browser.mp4"
+    run_proc = run_proc_factory(job_id)
+    ffmpeg_bin = find_ffmpeg()
+
+    async def attempt(cmd: list[str]) -> int:
+        try:
+            proc, _stdout, _stderr = await run_proc(cmd, timeout=1800.0)
+            return proc.returncode
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Browser-media normalization process failed for %s: %s",
+                log_safe(video_path),
+                log_safe(exc),
+            )
+            return 1
+
+    rc = 1
+    if not is_mp4:
+        rc = await attempt(
+            [
+                ffmpeg_bin, "-y", "-i", video_path,
+                "-c:v", "copy", "-c:a", "copy",
+                "-movflags", "+faststart", target,
+            ]
+        )
+        if rc == 0 and os.path.exists(target):
+            target_vcodec, target_acodec = await asyncio.to_thread(_probe_codecs, target)
+            if (
+                target_vcodec not in _BROWSER_VIDEO_CODECS
+                or target_acodec not in _BROWSER_AUDIO_CODECS
+            ):
+                rc = 1
+        else:
+            rc = 1
+    if rc != 0:
+        rc = await attempt(
+            [
+                ffmpeg_bin, "-y", "-i", video_path,
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+                "-movflags", "+faststart", target,
+            ]
+        )
+    if rc == 0 and os.path.exists(target) and target != video_path:
+        try:
+            os.remove(video_path)
+        except OSError:
+            pass  # Best effort: the normalized target is already complete.
+        return target
+    logger.warning(
+        "Could not transcode %s to browser-playable mp4 — the in-app "
+        "video player may render this file as a black box.",
+        log_safe(video_path),
+    )
+    return video_path
+
+
+# Bounded retry for transient download failures (#579/#598). yt-dlp's own
+# `retries`/`fragment_retries` cover per-fragment HTTP flakes, but a broken
+# pipe ([Errno 32]) raised while the write side of a pipe closes mid-stream
+# (a killed ffmpeg merge child, a CDN reset during muxing) aborts the whole
+# `extract_info` call and is NOT covered by them — so a single transient blip
+# failed the entire ingest with a raw "Broken pipe". We add a small download-
+# level retry on top, cleaning up the partial download between attempts so a
+# half-written `original.*` can't poison the next try.
+_YT_DOWNLOAD_RETRIES = 2  # total attempts = 1 + retries = 3
+
+
+def _with_target_facts(exc: BaseException, job_dir: str) -> BaseException:
+    """``exc`` with the download destination described, when the failure looks
+    like the OS refusing a file operation (#1225).
+
+    Returns ``exc`` untouched for network/format failures — their message is
+    already about the remote side, and appending disk facts would just be
+    noise. Never raises."""
+    try:
+        # Shared with failure.classify() so the "is this a disk problem?"
+        # answer can't differ between the class we assign and whether we
+        # bother naming the folder (#1225 review).
+        if not failure.is_os_write_refusal(str(exc)):
+            return exc
+        facts = failure.describe_path_target(os.path.join(job_dir, "original.mp4"))
+        if not facts:
+            return exc
+        msg = (
+            f"{exc} — saving to {job_dir} ({facts}). The OS refused the write, "
+            f"so retrying the same link won't help: check the drive isn't full, "
+            f"the folder is writable, and antivirus or a cloud-sync client "
+            f"(OneDrive, Dropbox) isn't locking it."
+        )
+        try:
+            return type(exc)(msg)
+        except Exception:
+            # Not every exception class takes a plain message (soundfile's
+            # LibsndfileError wants an int code). Keep the text, drop the type.
+            return RuntimeError(msg)
+    except Exception:
+        return exc
+
+
+def _is_transient_download_error(exc: BaseException) -> bool:
+    """True when a download failure is worth retrying (broken pipe / net drop).
+
+    Reuses the single failure taxonomy (`VIDEO_DOWNLOAD_NETWORK`) rather than a
+    parallel keyword list, so "what counts as transient" stays single-sourced
+    with the error-hint classification. ``BrokenPipeError``/``ConnectionError``
+    are matched by class too, since a bare instance may be wrapped or re-raised
+    with a stripped message that no longer contains "broken pipe".
+    """
+    if isinstance(exc, (BrokenPipeError, ConnectionError)):
+        return True
+    return failure.classify(str(exc)) == "VIDEO_DOWNLOAD_NETWORK"
+
+
+# YouTube serves some videos' high-quality formats signature-protected to the
+# default player client, so the media download 403s even though extraction
+# worked. Forcing an alternate client commonly bypasses it; on a 403 we escalate
+# through these (in order) before giving up (#625).
+_YT_PLAYER_CLIENTS = ["tv", "android", "web_safari"]
+
+
+def _is_forbidden_download_error(exc: BaseException) -> bool:
+    """True for a failure the CURRENT player client can't get past, but another
+    one commonly can.
+
+    A 403 is the original case (#625): extraction worked, the media fetch was
+    refused, and the same client keeps refusing. "This video is DRM protected"
+    (#1254) behaves identically and belongs here for the same reason — YouTube
+    serves a DRM-only format set to *some* player clients for videos that are
+    not actually DRM'd. The reporter saw it fail and then succeed on a plain
+    retry of the same URL, which is exactly what a per-client format set looks
+    like from outside. Escalating the client is the fix; a bare retry only
+    works when the next attempt happens to draw a different one.
+    """
+    s = str(exc)
+    if "403" in s or "Forbidden" in s:
+        return True
+    low = s.lower()
+    return "drm protected" in low or "drm-protected" in low
+
+
+def _cleanup_partial_download(job_dir: str) -> None:
+    """Remove any half-written `original.*` files before a retry.
+
+    A partial download left on disk would otherwise be picked up as a "finished"
+    file by the post-download codec probe, or collide with the next attempt's
+    output. Raises a stable error instead of retrying against unsafe stale data.
+    """
+    import glob
+    for stale in glob.glob(os.path.join(job_dir, "original.*")):
+        try:
+            os.remove(stale)
+        except OSError as exc:
+            logger.warning("Partial video download cleanup failed")
+            raise RuntimeError(
+                "Could not prepare the video download retry. Close any app using its temporary files and retry."
+            ) from exc
+
+
+def _delete_cookie_export(cookie_file: str | None) -> bool:
+    """Best-effort removal of the per-import authentication export."""
+    if not cookie_file:
+        return True
+    try:
+        os.unlink(cookie_file)
+    except OSError:
+        # Best effort: cleanup must never replace the download result.
+        return False
+    return True
 
 
 def yt_download_sync(
@@ -463,6 +931,7 @@ def yt_download_sync(
     fetch_subs: bool = False,
     sub_langs: list[str] | None = None,
     progress_hook=None,
+    cookie_file: str | None = None,
 ) -> tuple[str, str, list[str]]:
     """Blocking yt-dlp download into `job_dir`.
 
@@ -479,6 +948,22 @@ def yt_download_sync(
     import glob
     import yt_dlp
     outtmpl = os.path.join(job_dir, "original.%(ext)s")
+    # #1225: yt-dlp surfaces an OS write rejection as a bare
+    # "Unable to download video: [Errno 22] Invalid argument" — no path, no
+    # reason, and three manual retries all fail identically because nothing
+    # about it is transient. Fail here instead, naming the directory, when we
+    # can already see it won't work.
+    _target_facts = failure.describe_path_target(outtmpl)
+    if "not writable" in _target_facts or "does not exist" in _target_facts:
+        # Worded so classify() places it in the download path: it must carry
+        # both an OS-refusal signature and download context, or the user gets
+        # no hint at all — the failure this PR exists to fix (#1225 review).
+        raise OSError(
+            f"Unable to download video: unable to open for writing in "
+            f"{job_dir} ({_target_facts}). The video downloads into this job "
+            f"folder under your VoiceStudio data directory — check it exists, is "
+            f"writable, and isn't locked by antivirus or a cloud-sync client."
+        )
     ydl_opts: dict = {
         "outtmpl": outtmpl,
         # Prefer h264+aac streams so the merged mp4 is natively decodable
@@ -501,6 +986,12 @@ def yt_download_sync(
         "quiet": True,
         "no_warnings": True,
         "restrictfilenames": True,
+        # Don't stamp the downloaded file's mtime with the video's upload date
+        # (#642): on Windows an out-of-range/invalid timestamp makes the os.utime
+        # call raise `[Errno 22] Invalid argument`, failing the whole ingest. We
+        # download to a throwaway `original.*` and never use its mtime, so skip
+        # it entirely (equivalent to yt-dlp's --no-mtime).
+        "updatetime": False,
         "socket_timeout": 30,
         # Resilience against YouTube CDN flakes: a single empty fragment
         # (commonly the very last one — "Did not get any data blocks")
@@ -512,17 +1003,74 @@ def yt_download_sync(
         "extractor_retries": 5,
         "skip_unavailable_fragments": True,
     }
+    if cookie_file:
+        ydl_opts["cookiefile"] = cookie_file
+    # #712: the format selector above pulls separate video+audio streams, so
+    # yt-dlp muxes them via ffmpeg (merge_output_format=mp4). yt-dlp only looks
+    # for ffmpeg on PATH and aborts with "you have requested merging of multiple
+    # formats but ffmpeg is not installed" — but VoiceStudio's ffmpeg is often a
+    # bundled Tauri sidecar / imageio-ffmpeg binary that isn't on PATH (common on
+    # Windows). Point yt-dlp at the exact ffmpeg we resolve so the merge works.
+    _ffmpeg_bin = find_ffmpeg()
+    if _ffmpeg_bin:
+        ydl_opts["ffmpeg_location"] = _ffmpeg_bin
     if progress_hook is not None:
         ydl_opts["progress_hooks"] = [progress_hook]
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        path = ydl.prepare_filename(info)
-        root, _ = os.path.splitext(path)
-        mp4 = root + ".mp4"
-        if os.path.exists(mp4):
-            video_path = mp4
-        else:
-            video_path = path
+
+    # Download with a bounded retry on transient/broken-pipe-class failures
+    # (#579/#598). A broken pipe mid-mux isn't recoverable inside yt-dlp's own
+    # fragment retries, but a fresh `extract_info` usually succeeds. Between
+    # attempts we wipe the partial `original.*` so a half-written file can't be
+    # mistaken for a finished download.
+    info = None
+    path = None
+    transient_used = 0
+    client_idx = 0
+    while True:
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                path = ydl.prepare_filename(info)
+            break
+        except Exception as exc:
+            _cleanup_partial_download(job_dir)
+            # 403 Forbidden: not transient — escalate the YouTube player client,
+            # which commonly bypasses a signature-protected format set (#625).
+            if _is_forbidden_download_error(exc) and client_idx < len(_YT_PLAYER_CLIENTS):
+                client = _YT_PLAYER_CLIENTS[client_idx]
+                client_idx += 1
+                ydl_opts = {**ydl_opts, "extractor_args": {"youtube": {"player_client": [client]}}}
+                logger.warning(
+                    "Download 403 for %s — retrying with player_client=%s (#625)", log_safe(url), log_safe(client),
+                )
+                continue
+            # Transient/broken-pipe: a fresh extract_info usually succeeds
+            # (#579/#598). A 403 never counts here — it's escalated above.
+            if (transient_used < _YT_DOWNLOAD_RETRIES
+                    and _is_transient_download_error(exc)
+                    and not _is_forbidden_download_error(exc)):
+                transient_used += 1
+                logger.warning(
+                    "Transient download failure for %s (attempt %d/%d): %s — retrying",
+                    log_safe(url), transient_used, _YT_DOWNLOAD_RETRIES, log_safe(exc),
+                )
+                time.sleep(2 * transient_used)  # brief, increasing backoff
+                continue
+            # #1225: an OS-level rejection (errno 22 / EACCES / ENOSPC) tells
+            # the user nothing on its own. Attach what we can observe about
+            # the destination so the message identifies a full drive, a
+            # removed folder, or an antivirus/cloud-sync lock. Wording keeps
+            # the yt-dlp text so classify() still sees the download context.
+            described = _with_target_facts(exc, job_dir)
+            if described is exc:
+                raise
+            raise described from exc
+    root, _ = os.path.splitext(path)
+    mp4 = root + ".mp4"
+    if os.path.exists(mp4):
+        video_path = mp4
+    else:
+        video_path = path
     # Browser-playability guard: WKWebView (Tauri on macOS) refuses to
     # decode VP9/AV1 video and Opus audio even when they're wrapped in an
     # mp4 container, and refuses .webm/.mkv outright. We probe the actual
@@ -540,7 +1088,7 @@ def yt_download_sync(
             manual = list((info.get("subtitles") or {}).keys())
             langs = sorted({*manual, *([orig] if orig else [])})
         if not langs:
-            logger.info("No captions available on %s (skipping subtitle pass)", url)
+            logger.info("No captions available on %s (skipping subtitle pass)", log_safe(url))
         else:
             sub_opts = {
                 **ydl_opts,
@@ -560,7 +1108,7 @@ def yt_download_sync(
             except Exception as e:
                 logger.warning(
                     "Subtitle download failed for %s (continuing with video): %s",
-                    url, e,
+                    log_safe(url), log_safe(e),
                 )
             base = os.path.splitext(video_path)[0]
             sub_files = sorted(glob.glob(base + ".*.vtt"))
@@ -639,11 +1187,15 @@ async def ingest_pipeline(
     # Audio-only jobs (#119) skip scene detection + thumbnailing below; the
     # transcribe → translate → TTS core is identical.
     input_type = (source.get("input_type") or "video").lower()
+    # Declare the run so a "clear history" arriving before this job's first
+    # persistence can still withdraw it (#1252 review).
+    begin_ingest(job_id)
     try:
         if source.get("kind") == "url":
             url = source["url"]
             fetch_subs = bool(source.get("fetch_subs"))
             sub_langs = source.get("sub_langs") or None
+            cookie_file = source.get("cookie_file") or None
             yield prep_event("download_start", url=url)
             # Bridge yt-dlp's per-fragment progress callback (fires inside
             # the worker thread) into the async generator via a threadsafe
@@ -673,6 +1225,7 @@ async def ingest_pipeline(
                 yt_download_sync, url, job_dir,
                 fetch_subs=fetch_subs, sub_langs=sub_langs,
                 progress_hook=_yt_progress,
+                cookie_file=cookie_file,
             ))
             try:
                 while not dl_task.done():
@@ -687,12 +1240,16 @@ async def ingest_pipeline(
                     yield prep_event("download_progress", **payload)
                 video_path, title, sub_files = await dl_task
             except Exception as e:
-                logger.exception("Download failed for job %s", job_id)
+                logger.error("Download failed for job %s: %s", log_safe(job_id), log_safe(e))
                 if not dl_task.done():
                     dl_task.cancel()
                 yield prep_event("error", **failure.build_failure(e, stage="download"))
                 shutil.rmtree(job_dir, ignore_errors=True)
                 return
+            # yt-dlp (including its optional subtitle pass) is finished. Drop
+            # the login credential before the much longer audio-prep stages.
+            if _delete_cookie_export(cookie_file):
+                source["cookie_file"] = None
             filename = title or os.path.basename(video_path)
             try:
                 size = os.path.getsize(video_path)
@@ -731,10 +1288,35 @@ async def ingest_pipeline(
             if p.returncode != 0:
                 msg = (stderr.decode(errors="replace") or f"ffmpeg returned exit code {p.returncode}").strip()[:500]
                 raise Exception(msg)
+            # Second, FULL-QUALITY extraction for source separation. audio.wav
+            # is deliberately 16 kHz mono — that's what ASR wants — but Demucs
+            # used to separate that same file, so the music bed inherited mono
+            # (stereo image destroyed: L/R correlation 1.000 vs the original's
+            # 0.754, measured) and an 8 kHz ceiling (nothing real above half
+            # the ASR rate — the bed's "muffled" sound at its source). Demucs
+            # resamples to 44.1 kHz internally either way, so separating the
+            # stereo original costs about the same and returns a true-stereo,
+            # full-band bed. Best-effort: on failure Demucs falls back to the
+            # ASR file, which is exactly the old behavior.
+            audio_hq_path = os.path.join(job_dir, "audio_hq.wav")
+            try:
+                p_hq, _, stderr_hq = await run_proc([
+                    ffmpeg, "-i", video_path, "-vn", "-acodec", "pcm_s16le",
+                    "-ar", "44100", "-ac", "2", audio_hq_path, "-y",
+                ])
+                if p_hq.returncode != 0 or not os.path.exists(audio_hq_path):
+                    logger.warning(
+                        "HQ audio extraction failed (rc=%s) — separation falls "
+                        "back to the 16k mono ASR file", p_hq.returncode,
+                    )
+                    audio_hq_path = None
+            except Exception as e_hq:  # noqa: BLE001 — quality upgrade, never fatal
+                logger.warning("HQ audio extraction errored (%s) — falling back", log_safe(e_hq))
+                audio_hq_path = None
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.exception("Extract failed for job %s", job_id)
+            logger.error("Extract failed for job %s: %s", log_safe(job_id), log_safe(e))
             yield prep_event("error", **failure.build_failure(e, stage="extract"))
             return
 
@@ -743,12 +1325,19 @@ async def ingest_pipeline(
         except Exception:
             dur = 0.0
 
+        # URL downloads already pass through this guard in yt_download_sync.
+        # Uploaded videos did not, so a valid VP9/AV1/Opus upload could be
+        # processed successfully but remain undecodable by the in-app WebView.
+        # Codec probing/transcoding is blocking; keep it off the event loop.
+        if source.get("kind") != "url" and input_type != "audio":
+            video_path = await _ensure_browser_playable_mp4_for_job(job_id, video_path)
+
         # Content-hash cache: reuse artifacts from previous matching jobs.
         content_hash = await asyncio.to_thread(compute_file_hash, audio_path)
         cached = find_cached_job(content_hash, job_id)
         if cached:
             logger.info("Cache hit for job %s (hash %s) → reusing artifacts from %s",
-                        job_id, content_hash[:12], cached["job_id"])
+                        log_safe(job_id), log_safe(content_hash[:12]), log_safe(cached["job_id"]))
             vocals_path = os.path.join(job_dir, "vocals.wav")
             no_vocals_path = os.path.join(job_dir, "no_vocals.wav")
             thumb_path = os.path.join(job_dir, "thumb.jpg")
@@ -781,9 +1370,14 @@ async def ingest_pipeline(
                 "scene_cuts": scene_cuts,
                 "youtube_subs": youtube_subs_by_lang or None,
                 "input_type": input_type,
+                "source_lang_override": source.get("source_lang"),
             }
-            put_job(job_id, full_job)
-            save_job(job_id, full_job, filename, dur, content_hash)
+            if not put_and_save_job(
+                job_id, full_job, filename=filename, duration=dur, content_hash=content_hash,
+            ):
+                logger.info("Dub job %s was deleted during ingest — discarding its result", log_safe(job_id))
+                yield prep_event("cancelled")
+                return
             yield prep_event("extract_done", job_id=job_id, duration=round(dur, 2), filename=filename)
             yield prep_event("cached",
                              has_bg=bool(no_vocals_path and os.path.exists(no_vocals_path)),
@@ -805,9 +1399,14 @@ async def ingest_pipeline(
                 "scene_cuts": [],
                 "youtube_subs": youtube_subs_by_lang or None,
                 "input_type": input_type,
+                "source_lang_override": source.get("source_lang"),
             }
-            put_job(job_id, partial)
-            save_job(job_id, partial, filename, dur, content_hash)
+            if not put_and_save_job(
+                job_id, partial, filename=filename, duration=dur, content_hash=content_hash,
+            ):
+                logger.info("Dub job %s was deleted during ingest — discarding its result", log_safe(job_id))
+                yield prep_event("cancelled")
+                return
             yield prep_event("extract_done", job_id=job_id, duration=round(dur, 2), filename=filename)
 
             vocals_path = os.path.join(job_dir, "vocals.wav")
@@ -818,7 +1417,7 @@ async def ingest_pipeline(
             try:
                 demucs_cmd = [sys.executable, "-m", "demucs.separate",
                               "--two-stems", "vocals", "-n", "htdemucs", "-d", get_best_device(),
-                              audio_path, "-o", job_dir]
+                              audio_hq_path or audio_path, "-o", job_dir]
                 rc = -1
                 stderr_full = b""
                 last_pct = -1
@@ -838,7 +1437,12 @@ async def ingest_pipeline(
                         rc, stderr_full = evt[1], evt[2]
                 if rc != 0:
                     raise Exception(stderr_full.decode(errors="replace")[:500])
-                demucs_out = os.path.join(job_dir, "htdemucs", "audio")
+                # Stems land under the INPUT's basename ("audio_hq" when the
+                # full-quality extraction succeeded, "audio" on its fallback).
+                demucs_out = os.path.join(
+                    job_dir, "htdemucs",
+                    os.path.splitext(os.path.basename(audio_hq_path or audio_path))[0],
+                )
                 if os.path.exists(os.path.join(demucs_out, "vocals.wav")):
                     shutil.move(os.path.join(demucs_out, "vocals.wav"), vocals_path)
                     shutil.move(os.path.join(demucs_out, "no_vocals.wav"), no_vocals_path)
@@ -846,7 +1450,7 @@ async def ingest_pipeline(
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.warning("Demucs failed for %s, falling back to mixed audio: %s", job_id, e)
+                logger.warning("Demucs failed for %s, falling back to mixed audio: %s", log_safe(job_id), log_safe(e))
                 # plan-04: surface the degradation (job continues with mixed audio).
                 yield prep_event("warning", **failure.build_failure(e, stage="demucs", include_diagnostic=False))
                 vocals_path = audio_path
@@ -877,7 +1481,7 @@ async def ingest_pipeline(
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    logger.warning("Scene detection failed for %s: %s", job_id, e)
+                    logger.warning("Scene detection failed for %s: %s", log_safe(job_id), log_safe(e))
                     yield prep_event("warning", **failure.build_failure(e, stage="scene", include_diagnostic=False))
                 yield prep_event("scene_done", count=len(scene_cuts))
 
@@ -891,20 +1495,37 @@ async def ingest_pipeline(
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    logger.warning("Thumbnail extraction failed for %s: %s", job_id, e)
+                    logger.warning("Thumbnail extraction failed for %s: %s", log_safe(job_id), log_safe(e))
                     yield prep_event("warning", **failure.build_failure(e, stage="thumbnail", include_diagnostic=False))
 
-            _dub_jobs[job_id].update({
-                "vocals_path": vocals_path,
-                "no_vocals_path": no_vocals_path,
-                "thumb_path": thumb_path if (thumb_path and os.path.exists(thumb_path)) else None,
-                "scene_cuts": scene_cuts,
-            })
-            save_job(job_id, _dub_jobs[job_id], filename, dur, content_hash)
+            # The job can legitimately be gone by now — everything above takes
+            # minutes and `DELETE /dub/history/{id}` pops the record. Deleting
+            # an in-flight dub used to raise KeyError here and surface as the
+            # toast `ingest: 'mgw39lx3'` (#1252/#1253). A withdrawn job is not
+            # an error: stop quietly rather than re-persisting what the user
+            # just deleted.
+            # Merge and persist as one step: a delete landing BETWEEN them
+            # would remove the row and then have it written straight back, so
+            # the dub the user deleted reappears in history (#1252 review).
+            if not merge_and_save_job(
+                job_id,
+                {
+                    "vocals_path": vocals_path,
+                    "no_vocals_path": no_vocals_path,
+                    "thumb_path": thumb_path if (thumb_path and os.path.exists(thumb_path)) else None,
+                    "scene_cuts": scene_cuts,
+                },
+                filename=filename,
+                duration=dur,
+                content_hash=content_hash,
+            ):
+                logger.info("Dub job %s was deleted during ingest — discarding its result", log_safe(job_id))
+                yield prep_event("cancelled")
+                return
             yield prep_event("ready", job_id=job_id, duration=round(dur, 2), filename=filename)
 
     except asyncio.CancelledError:
-        logger.info("Dub prep cancelled for job %s; killing subprocesses and cleaning up", job_id)
+        logger.info("Dub prep cancelled for job %s; killing subprocesses and cleaning up", log_safe(job_id))
         kill_job_procs(job_id)
         try:
             shutil.rmtree(job_dir, ignore_errors=True)
@@ -916,9 +1537,15 @@ async def ingest_pipeline(
         # plan-04 (#131): no unhandled ingest failure may be silent. Log the
         # real traceback and surface a structured, non-empty reason with stage
         # context instead of letting it bubble up as a bare task error.
-        logger.exception("Ingest pipeline failed for job %s", job_id)
+        logger.error("Ingest pipeline failed for job %s: %s", log_safe(job_id), log_safe(e))
         yield prep_event("error", **failure.build_failure(e, stage="ingest"))
         return
     finally:
+        # Cookie exports are login credentials. Keep an explicitly selected
+        # export only for this download, then remove it on success, failure or
+        # cancellation; never copy it into the project/job directory.
+        cookie_file = source.get("cookie_file")
+        _delete_cookie_export(cookie_file)
+        end_ingest(job_id)
         with _active_procs_lock:
             _active_procs.pop(job_id, None)

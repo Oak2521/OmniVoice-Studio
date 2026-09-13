@@ -1,4 +1,4 @@
-"""Alembic environment for OmniVoice Studio.
+"""Alembic environment for VoiceStudio.
 
 DB URL is computed from `core.config.DB_PATH` at runtime so Alembic honours
 the same `OMNIVOICE_DATA_DIR` override the app does. We use SQLite, so both
@@ -16,8 +16,25 @@ from sqlalchemy import engine_from_config, pool
 from core.config import DB_PATH  # noqa: E402 — backend/ is on sys.path via alembic.ini
 
 config = context.config
-if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+if config.config_file_name is not None and config.attributes.get("configure_logger", True):
+    # `disable_existing_loggers=False` is deliberate: this env runs *inside* the
+    # live app (startup `alembic upgrade head`), so the default (True) would
+    # disable every already-created application logger — e.g. silence
+    # `omnivoice.db.backup`'s "Skipping pre-migration DB backup" line and the
+    # rest of the app's logging for the remainder of the process. A migration
+    # must never mute the app (or leak that mute across a test session).
+    #
+    # The `configure_logger` attribute gate exists for the same reason (#1174):
+    # even with disable_existing_loggers=False, fileConfig() REPLACES the root
+    # logger's handlers with alembic.ini's console handler and applies its
+    # `[logger_root] level=WARN` — so any boot that actually ran migrations
+    # (every FIRST RUN, every upgrade) lost the rolling omnivoice.log file
+    # handler and every subsequent INFO line for the rest of the process,
+    # including the entire graceful-shutdown trace: a SIGTERM'd clean quit
+    # looked like a silent crash. The in-app runner (core/db.py
+    # `_run_alembic_upgrade`) sets configure_logger=False; the standalone
+    # `alembic` CLI doesn't, and keeps this logging config.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # SQLite file URL. Honour an externally-set URL (tests pass one via
 # `cfg.set_main_option("sqlalchemy.url", ...)` to point at a fixture DB),

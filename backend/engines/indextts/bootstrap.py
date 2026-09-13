@@ -1,4 +1,4 @@
-"""IndexTTS-2 venv probe + lazy bootstrap (Phase 2 Plan 02-03).
+"""IndexTTS 2.5/2 venv probe + lazy bootstrap (Phase 2 Plan 02-03).
 
 The parent process needs to know *which Python interpreter* to spawn the
 IndexTTS sidecar under. This module owns that resolution. The probe runs
@@ -13,9 +13,9 @@ Probe order (Open Question #1 resolution from 02-RESEARCH.md):
        Windows). Highest priority — power users who already cloned
        IndexTTS and ran ``uv pip install -e .`` get zero migration cost.
     2. ``backend/engines/indextts/.venv/`` — this package's own venv,
-       created by step 3 if needed. Survives across OmniVoice upgrades;
+       created by step 3 if needed. Survives across VoiceStudio upgrades;
        the IndexTTS clone is referenced via ``uv pip install -e`` so
-       weights and code live in the user's clone, not under OmniVoice.
+       weights and code live in the user's clone, not under VoiceStudio.
     3. Bootstrap: run ``uv venv`` then ``uv pip install -e
        ${OMNIVOICE_INDEXTTS_DIR}`` to populate step-2's venv. Requires
        OMNIVOICE_INDEXTTS_DIR to be set (otherwise we don't know where
@@ -41,11 +41,11 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
 import subprocess
-import sys
 from pathlib import Path
 from typing import Optional
+
+from engines._venv_probe import ProbeResult, log_safe, venv_can_import
 
 logger = logging.getLogger("omnivoice.indextts.bootstrap")
 
@@ -57,13 +57,23 @@ INDEXTTS_SIDECAR_SCRIPT: Path = Path(__file__).parent / "main.py"
 # bootstrapped, is installed into this venv via ``uv pip install -e``.
 _ENGINES_VENV_DIR: Path = Path(__file__).parent / ".venv"
 
+
+def _uv_env() -> "dict[str, str] | None":
+    """uv cache co-location for installs on a non-system volume (D:-drive /
+    portable installs): without it uv stages every wheel on the system drive
+    and cross-volume COPIES it into the venv. Canonical logic lives in
+    services.sidecar_install.uv_subprocess_env (lazy import, like _locate_uv).
+    """
+    from services.sidecar_install import uv_subprocess_env
+    return uv_subprocess_env(_ENGINES_VENV_DIR.parent.parent)
+
 # Per-process resolution cache. Cleared by :func:`invalidate` for tests.
 _resolved_python: Optional[Path] = None
 
-# Timeouts. ``_venv_can_import_indextts`` is a bounded probe so we never
-# hang waiting on a broken venv; the bootstrap install can take minutes
-# on a cold cache (indextts pulls torch, transformers<5, etc.).
-_IMPORT_PROBE_TIMEOUT_S = 10
+# Timeouts. The import probe's bound lives in ``engines._venv_probe`` (shared
+# with every other subprocess engine, and tunable per host); the bootstrap
+# install can take minutes on a cold cache (indextts pulls torch,
+# transformers<5, etc.).
 _UV_VENV_TIMEOUT_S = 120
 _UV_PIP_INSTALL_TIMEOUT_S = 900
 
@@ -105,31 +115,57 @@ def resolve_indextts_venv() -> Path:
     if _resolved_python is not None:
         return _resolved_python
 
+    # A candidate whose probe ran out of time (#1414). Preferred over
+    # bootstrapping or declaring the engine missing, but only once every
+    # candidate has had its chance to prove itself outright.
+    unproven: Optional[Path] = None
+
     # Probe 1 — user's clone-level venv (highest priority for back-compat).
     omv_dir = os.environ.get("OMNIVOICE_INDEXTTS_DIR")
     if omv_dir:
         cand = _venv_python_path(Path(omv_dir) / ".venv")
-        if cand.is_file() and _venv_can_import_indextts(cand):
-            logger.info(
-                "IndexTTS venv resolved from OMNIVOICE_INDEXTTS_DIR: %s", cand,
-            )
-            _resolved_python = cand
-            return cand
+        if cand.is_file():
+            verdict = _venv_can_import_indextts(cand)
+            if verdict == "yes":
+                logger.info(
+                    "IndexTTS venv resolved from OMNIVOICE_INDEXTTS_DIR: %s", cand,
+                )
+                _resolved_python = cand
+                return cand
+            if verdict == "unproven":
+                unproven = cand
 
     # Probe 2 — this package's own venv.
     cand = _venv_python_path(_ENGINES_VENV_DIR)
-    if cand.is_file() and _venv_can_import_indextts(cand):
-        logger.info("IndexTTS venv resolved from engines path: %s", cand)
-        _resolved_python = cand
-        return cand
+    if cand.is_file():
+        verdict = _venv_can_import_indextts(cand)
+        if verdict == "yes":
+            logger.info("IndexTTS venv resolved from engines path: %s", cand)
+            _resolved_python = cand
+            return cand
+        if verdict == "unproven" and unproven is None:
+            unproven = cand
+
+    if unproven is not None:
+        # Nothing proved itself, but something plausible is installed. Use it:
+        # a venv that really is broken fails the sidecar handshake with a real
+        # error, which beats reinstalling over the top of a working install or
+        # telling the user their engine isn't there.
+        logger.warning(
+            "IndexTTS venv %s could not be verified in time; using it anyway "
+            "rather than treating a slow import as a missing install (#1414).",
+            log_safe(unproven),
+        )
+        _resolved_python = unproven
+        return unproven
 
     # Probe 3 — bootstrap.
     if not omv_dir:
         raise RuntimeError(
-            "IndexTTS-2 is not installed. Set the OMNIVOICE_INDEXTTS_DIR "
+            "IndexTTS 2.5 is not installed. Set the OMNIVOICE_INDEXTTS_DIR "
             "environment variable to your IndexTTS clone (the directory "
             "that contains checkpoints/ and pyproject.toml), then restart "
-            "OmniVoice. See docs/engines/indextts.md for the full install "
+            "VoiceStudio. See docs/engines/indextts.md for the full install "
             "walk-through."
         )
 
@@ -145,11 +181,12 @@ def _venv_python_path(venv_dir: Path) -> Path:
     """Return the python executable path inside a venv directory.
 
     Handles the Unix (``bin/python``) vs Windows (``Scripts/python.exe``)
-    layout. No filesystem access — caller checks .is_file().
+    layout. No filesystem access — caller checks .is_file(). Delegates to
+    the canonical implementation in :mod:`services.sidecar_install` so the
+    cross-platform venv-layout rule lives in exactly one place.
     """
-    if sys.platform == "win32":
-        return venv_dir / "Scripts" / "python.exe"
-    return venv_dir / "bin" / "python"
+    from services.sidecar_install import _venv_python
+    return _venv_python(venv_dir)
 
 
 def _probe_paths() -> list[Path]:
@@ -162,41 +199,31 @@ def _probe_paths() -> list[Path]:
     return out
 
 
-def _venv_can_import_indextts(python_path: Path) -> bool:
-    """Spawn the candidate python and verify ``import indextts.infer_v2`` works.
+def _venv_can_import_indextts(python_path: Path) -> ProbeResult:
+    """Verify IndexTTS 2.5, retaining user-managed IndexTTS-2 compatibility.
 
-    Bounded by ``_IMPORT_PROBE_TIMEOUT_S`` so a wedged venv never hangs
-    the parent. Returns False on any failure (non-zero exit, timeout,
-    OSError).
+    Tri-state — "yes" / "no" / "unproven". See ``engines._venv_probe``: a
+    probe that runs out of time proves nothing, and treating that as "no"
+    is what discarded working OMNIVOICE_INDEXTTS_DIR installs (#1414).
     """
-    try:
-        proc = subprocess.run(
-            [str(python_path), "-c", "import indextts.infer_v2"],
-            capture_output=True,
-            timeout=_IMPORT_PROBE_TIMEOUT_S,
-        )
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        logger.debug("indextts import probe failed for %s: %s", python_path, exc)
-        return False
-    if proc.returncode != 0:
-        logger.debug(
-            "indextts import probe non-zero for %s: %s",
-            python_path,
-            proc.stderr.decode("utf-8", errors="replace")[:200],
-        )
-        return False
-    return True
+    probe = (
+        "try:\n import indextts.infer_v2_5\n"
+        "except ModuleNotFoundError as exc:\n"
+        " if exc.name != 'indextts.infer_v2_5': raise\n"
+        " import indextts.infer_v2\n"
+    )
+    return venv_can_import(python_path, probe, engine="indextts", logger=logger)
 
 
 def _locate_uv() -> Optional[str]:
-    """Find the uv binary — bundled first (Tauri-set env var), else PATH."""
-    bundled = os.environ.get("OMNIVOICE_BUNDLED_UV")
-    if bundled and Path(bundled).is_file():
-        return bundled
-    sys_uv = shutil.which("uv")
-    if sys_uv:
-        return sys_uv
-    return None
+    """Find the uv binary — bundled first (Tauri-set env var), else PATH.
+
+    Delegates to :mod:`services.sidecar_install`'s canonical resolver so the
+    bundled-uv contract (env var name, precedence) can't drift between this
+    lazy bootstrap and the one-click installer.
+    """
+    from services.sidecar_install import _locate_uv as _canonical_locate_uv
+    return _canonical_locate_uv()
 
 
 def _bootstrap_engines_venv(indextts_clone: Path) -> Path:
@@ -211,10 +238,10 @@ def _bootstrap_engines_venv(indextts_clone: Path) -> Path:
     uv = _locate_uv()
     if not uv:
         raise RuntimeError(
-            "uv is required to bootstrap the IndexTTS-2 venv but was not "
+            "uv is required to bootstrap the IndexTTS 2.5 venv but was not "
             "found on PATH (and the bundled uv path was not set via the "
             "OMNIVOICE_BUNDLED_UV env var). Install uv from "
-            "https://docs.astral.sh/uv/ and re-launch OmniVoice, or set "
+            "https://docs.astral.sh/uv/ and re-launch VoiceStudio, or set "
             "OMNIVOICE_BUNDLED_UV to the absolute path of a uv binary."
         )
 
@@ -229,6 +256,7 @@ def _bootstrap_engines_venv(indextts_clone: Path) -> Path:
             check=True,
             timeout=_UV_VENV_TIMEOUT_S,
             capture_output=True,
+            env=_uv_env(),
         )
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(
@@ -247,6 +275,7 @@ def _bootstrap_engines_venv(indextts_clone: Path) -> Path:
             check=True,
             timeout=_UV_PIP_INSTALL_TIMEOUT_S,
             capture_output=True,
+            env=_uv_env(),
         )
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(
@@ -255,10 +284,13 @@ def _bootstrap_engines_venv(indextts_clone: Path) -> Path:
             f"{exc.stderr.decode('utf-8', errors='replace') if exc.stderr else exc}"
         ) from exc
 
-    if not _venv_can_import_indextts(python_path):
+    # Only a *proven* failure is fatal here: a bootstrap that installed
+    # correctly and is merely slow to import must not be thrown away after
+    # spending minutes on the install (#1414).
+    if _venv_can_import_indextts(python_path) == "no":
         raise RuntimeError(
-            "IndexTTS bootstrap completed but `import indextts.infer_v2` "
-            f"still fails from {python_path}. Verify that "
+            "IndexTTS bootstrap completed but neither the 2.5 nor 2 inference "
+            f"module imports from {python_path}. Verify that "
             f"{indextts_clone} is a valid IndexTTS clone (contains "
             "pyproject.toml with the indextts package). See "
             "docs/engines/indextts.md."

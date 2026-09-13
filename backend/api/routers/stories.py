@@ -14,6 +14,7 @@ from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from fastapi.responses import Response
 
 from services.ffmpeg_utils import find_ffmpeg, spawn_subprocess
+from core.http_headers import content_disposition
 
 router = APIRouter()
 
@@ -32,7 +33,15 @@ async def stories_encode(
     format: str = Form("mp3"),
     bitrate: str = Form("192k"),
 ):
-    """Transcode an uploaded WAV to MP3/M4B/OGG and return the encoded bytes."""
+    """Transcode an uploaded WAV to MP3/M4B/OGG and return the encoded bytes.
+
+    Provenance note (#1169): this endpoint is a pure TRANSCODER, not a
+    synthesis producer — it never calls a TTS engine, so it must not call
+    mark_synthetic (the upload may be arbitrary user audio, and marking human
+    speech as synthetic would be wrong). Audio the Stories Editor stitched
+    from VoiceStudio generations is already marked at its producing route, and
+    the AudioSeal mark survives the lossy encode here.
+    """
     fmt = (format or "mp3").lower()
     if fmt not in _FORMATS:
         raise HTTPException(status_code=400, detail=f"Unsupported format: {format}")
@@ -68,7 +77,7 @@ async def stories_encode(
         return Response(
             content=encoded,
             media_type=mime,
-            headers={"Content-Disposition": f'attachment; filename="story.{ext}"'},
+            headers={"Content-Disposition": content_disposition(f"story.{ext}")},
         )
     finally:
         for p in (in_path, out_path):

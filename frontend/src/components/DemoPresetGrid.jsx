@@ -14,13 +14,15 @@
 import { useEffect, useRef, useState } from 'react';
 import { Play, Pause } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { DEMO_ICONS, FALLBACK_VOICE_ICON, stripVoiceEmoji } from '../utils/voiceIcons';
 import { API } from '../api/client';
-import './DemoPresetGrid.css';
+import { claimPlayback, stopActivePlayback } from '../utils/playback';
 
 export default function DemoPresetGrid({ presets, onUse }) {
   const { t } = useTranslation();
   const [playingId, setPlayingId] = useState(null);
   const audioRef = useRef(null);
+  const releaseRef = useRef(null);
 
   // Stop playback on unmount so leaving the Design tab mid-preview goes
   // silent immediately.
@@ -31,6 +33,8 @@ export default function DemoPresetGrid({ presets, onUse }) {
         audio.pause();
         audio.currentTime = 0;
       }
+      releaseRef.current?.();
+      releaseRef.current = null;
     };
   }, []);
 
@@ -38,46 +42,67 @@ export default function DemoPresetGrid({ presets, onUse }) {
     const audio = audioRef.current;
     if (!audio) return;
     if (playingId === preset.id) {
-      audio.pause();
-      setPlayingId(null);
+      // Our claim's stop pauses the element and clears playingId.
+      stopActivePlayback();
       return;
     }
+    // Claim the global playback slot (#316): stops any other preview/output
+    // that is currently playing before this one starts.
+    releaseRef.current = claimPlayback(() => {
+      audio.pause();
+      setPlayingId(null);
+    }, 'design-preview');
     audio.src = `${API}${preset.preview_url}`;
     audio.currentTime = 0;
-    audio.play()
+    audio
+      .play()
       .then(() => setPlayingId(preset.id))
       .catch((e) => {
         // Most common failure: WAV missing on disk (someone deleted it or
         // build_demos.sh hasn't been run). Fall back gracefully — the card
         // still works for "Use this design".
         console.warn('Preview playback failed:', e);
+        releaseRef.current?.();
+        releaseRef.current = null;
         setPlayingId(null);
       });
   };
 
   return (
-    <div className="demo-preset-grid">
+    <div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-[10px] mb-[12px]">
       {/* Single audio element shared across cards — keeps the "only one
           plays at a time" invariant without per-card state coordination. */}
       <audio
         ref={audioRef}
-        onEnded={() => setPlayingId(null)}
+        onEnded={() => {
+          setPlayingId(null);
+          releaseRef.current?.();
+          releaseRef.current = null;
+        }}
         preload="none"
       />
       {presets.map((p) => {
         const isPlaying = playingId === p.id;
+        const Icon = DEMO_ICONS[p.id] || FALLBACK_VOICE_ICON;
         return (
-          <div key={p.id} className="demo-preset-card">
-            <div className="demo-preset-card__head">
-              <span className="demo-preset-card__icon" aria-hidden>{p.icon}</span>
-              <span className="demo-preset-card__name">{p.name}</span>
+          <div
+            key={p.id}
+            className="flex flex-col gap-[6px] p-[12px] rounded-xl border border-border bg-[rgba(255,255,255,0.02)] [transition:border-color_120ms_ease,background_120ms_ease] hover:border-transparent hover:bg-[rgba(255,255,255,0.04)]"
+          >
+            <div className="inline-flex items-center gap-[6px]">
+              <span className="text-[16px] leading-none" aria-hidden>
+                <Icon size={18} />
+              </span>
+              <span className="text-[13px] font-bold text-fg">{stripVoiceEmoji(p.name)}</span>
             </div>
-            <p className="demo-preset-card__desc">{p.description}</p>
-            <code className="demo-preset-card__instruct">{p.instruct}</code>
-            <div className="demo-preset-card__actions">
+            <p className="m-0 text-[11px] leading-[1.35] text-fg-muted">{p.description}</p>
+            <code className="font-mono text-[10px] text-fg-subtle bg-[rgba(0,0,0,0.22)] px-[6px] py-[2px] rounded-md self-start max-w-full overflow-hidden text-ellipsis whitespace-nowrap">
+              {p.instruct}
+            </code>
+            <div className="flex gap-[6px] mt-auto pt-[4px]">
               <button
                 type="button"
-                className="demo-preset-card__preview"
+                className="demo-preset-card__preview flex-1 inline-flex items-center justify-center gap-[4px] px-[8px] py-[5px] text-[11px] font-semibold rounded-lg border border-border bg-transparent text-fg cursor-pointer [transition:background_100ms_ease,border-color_100ms_ease] hover:bg-[rgba(255,255,255,0.05)] hover:border-transparent"
                 onClick={() => handlePreview(p)}
                 aria-label={isPlaying ? `Pause ${p.name}` : `Preview ${p.name}`}
                 aria-pressed={isPlaying}
@@ -87,7 +112,7 @@ export default function DemoPresetGrid({ presets, onUse }) {
               </button>
               <button
                 type="button"
-                className="demo-preset-card__use"
+                className="flex-1 inline-flex items-center justify-center gap-[4px] px-[8px] py-[5px] text-[11px] font-semibold rounded-lg border border-transparent bg-[rgba(243,165,182,0.12)] text-fg cursor-pointer [transition:background_100ms_ease,border-color_100ms_ease] hover:border-transparent hover:bg-[rgba(243,165,182,0.22)]"
                 onClick={() => onUse(p)}
                 aria-label={`Use ${p.name} design`}
               >

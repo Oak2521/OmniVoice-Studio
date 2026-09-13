@@ -1,60 +1,56 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { Cpu, Mic, MessageSquare, Activity, AlertTriangle, CheckCircle2, RefreshCw, Layers } from 'lucide-react';
-import { toast } from 'react-hot-toast';
+import React, { useEffect, useState } from 'react';
+import {
+  Cpu,
+  Mic,
+  MessageSquare,
+  AlertTriangle,
+  RefreshCw,
+  Download,
+  ChevronRight,
+  Layers,
+} from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { listEngines, getEngineHealth } from '../api/engines';
-import { Badge, Button, Segmented, Table } from '../ui';
-import SupertonicLicenseDialog from './SupertonicLicenseDialog';
-import './EngineCompatibilityMatrix.css';
+import { Badge, Button, Tabs } from '../ui';
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table';
+import { cn } from '@/lib/utils';
+import EngineMark from './EngineMark';
+import useEngineInventory, { FORCE_WAIT_TIMEOUT_MS } from './engines/useEngineInventory';
+import EngineDetail from './engines/EngineDetail';
+import {
+  LABEL,
+  LICENSE_DIALOGS,
+  fmtDiskBytes,
+  reasonMentionsLicense,
+  runsOn,
+  statusOf,
+} from './engines/engineDisplay';
 
-/** Engines that gate first use behind an in-app license acceptance dialog.
- *  Phase 3 Plan 03-01 ‑‑ Supertonic-3 today; future OpenRAIL-M engines
- *  add themselves here alongside an in-tree dialog component. */
-const LICENSE_DIALOGS = {
-  supertonic3: SupertonicLicenseDialog,
-};
-
-/** Heuristic detector for the "license not accepted" backend reason
- *  message produced by Supertonic3Backend.is_available(). The backend
- *  message reads "Supertonic-3 license not accepted ..." so this prefix
- *  match is robust to wording tweaks. */
-function reasonMentionsLicense(reason) {
-  if (!reason || typeof reason !== 'string') return false;
-  return /license not accepted/i.test(reason);
-}
+export { FORCE_WAIT_TIMEOUT_MS, fmtDiskBytes };
 
 /**
- * Engine Compatibility Matrix (Plan 02-04 / ENGINE-06).
+ * Engine list + detail (the former "Engine Compatibility Matrix").
  *
- * Renders a single source-of-truth table of every registered backend in
- * a family (tts / asr / llm). Each row shows:
- *   * Engine display name
- *   * Install state (available / unavailable, with the failure reason
- *     inline when the row is unavailable)
- *   * GPU compat chips (cuda / mps / rocm / cpu)
- *   * Isolation mode (in-process or subprocess) — the visible payoff
- *     of the Plan 02-01 SubprocessBackend + Plan 02-03 IndexTTS migration
- *   * Last error (cached most-recent failure — distinguishes "currently
- *     failing" from "failed before, now working")
- *   * Test engine button — fires a `/engines/{id}/health` round-trip on
- *     demand; SubprocessBackend rows spawn-and-ping their sidecar, in-
- *     process rows fall back to `is_available()`. Latency is rendered
- *     inline next to the button.
+ * One row per engine, three columns — Engine · Runs on · Status — and one
+ * primary action (Use / Install). Everything else the row used to carry
+ * (GPU compatibility chips, isolation, install hints, health and self-test
+ * probes, install progress, setup snippet, disk usage, docs, license) lives
+ * in the detail panel for the selected row; until a row is picked the panel
+ * slot carries a one-line hint.
  *
- * Cross-platform contract: this component does NOT auto-spawn any
- * sidecar on mount; the user must click Test engine. That keeps macOS /
- * Windows / Linux behaviour identical and prevents the matrix from
- * locking up a cold IndexTTS install for 30 s every time Settings
- * loads. A short 5 s cooldown on the Test button prevents click-storms.
+ * All state and effects come from `useEngineInventory` (see its header for
+ * the cross-platform contract); this file is layout only.
  *
- * Props:
- *   - family: 'tts' | 'asr' | 'llm'  default 'tts'
- *   - onSelect?: (family, backendId) => Promise<void>  optional — when
- *     provided, a "Use" button appears next to "Test engine" for
- *     available, non-active rows. Lets the matrix double as an engine
- *     picker so Settings doesn't need a parallel table.
- *   - activeId?: string  the currently-active backend id for this
- *     family. Used to render the "active" badge.
+ * Props: family, onSelect(family, id, modelId?), activeId, showFamilyTabs,
+ *   onFamilyChange, reloadToken, catalogueLayout, sharedEngines, weights +
+ *   downloads (the host's catalog rows and useModelDownloads result, so the
+ *   panel lists the engine's weights), and the injectable api* seams.
  */
 const FAMILY_META = {
   tts: { label: 'TTS', icon: Cpu },
@@ -62,145 +58,75 @@ const FAMILY_META = {
   llm: { label: 'LLM', icon: MessageSquare },
 };
 
-const ISOLATION_TONE = {
-  subprocess: 'info',
-  'in-process': 'neutral',
-};
-
-const GPU_LABEL = {
-  cuda: 'CUDA',
-  mps: 'MPS',
-  rocm: 'ROCm',
-  cpu: 'CPU',
-};
-
-const TEST_COOLDOWN_MS = 5000;
-
-/** Subset of the unified engine entry the matrix actually reads. */
-function normalizeEntry(entry) {
-  return {
-    id: entry.id,
-    display_name: entry.display_name,
-    available: !!entry.available,
-    reason: entry.reason || null,
-    install_hint: entry.install_hint || null,
-    last_error: entry.last_error || null,
-    isolation_mode: entry.isolation_mode || 'in-process',
-    gpu_compat: Array.isArray(entry.gpu_compat) && entry.gpu_compat.length > 0
-      ? entry.gpu_compat
-      : ['cpu'],
-  };
-}
-
 export default function EngineCompatibilityMatrix({
   family = 'tts',
   onSelect = null,
   activeId = null,
-  // Test-friendly overrides — let the RTL suite mock the API layer
-  // without resorting to module-level vi.mock incantations.
-  apiListEngines = listEngines,
-  apiGetEngineHealth = getEngineHealth,
+  showFamilyTabs = true,
+  onFamilyChange = null,
+  reloadToken = 0,
+  catalogueLayout = false,
+  sharedEngines = null,
+  // The host's catalog rows + download machinery; the detail panel lists the
+  // selected engine's weights with them. Absent → no weights section.
+  weights = [],
+  downloads = null,
+  apiListEngines,
+  apiGetEngineHealth,
+  apiSelfTestEngine,
+  apiListLoadedModels,
+  apiUnloadModel,
+  apiInstallEngine,
+  apiInstallStatus,
+  apiGetDiskUsage,
 }) {
-  const { t } = useTranslation();
-  const [data, setData] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
-  const [activeFamily, setActiveFamily] = useState(family);
-  // Phase 3 Plan 03-01 / TTS-05: which engine has its license dialog
-  // currently open, or null. Only one dialog is ever open at a time.
-  const [licenseDialogFor, setLicenseDialogFor] = useState(null);
+  const { t, i18n } = useTranslation();
+  const inv = useEngineInventory({
+    family,
+    onSelect,
+    reloadToken,
+    sharedEngines,
+    ...(apiListEngines && { apiListEngines }),
+    ...(apiGetEngineHealth && { apiGetEngineHealth }),
+    ...(apiSelfTestEngine && { apiSelfTestEngine }),
+    ...(apiListLoadedModels && { apiListLoadedModels }),
+    ...(apiUnloadModel && { apiUnloadModel }),
+    ...(apiInstallEngine && { apiInstallEngine }),
+    ...(apiInstallStatus && { apiInstallStatus }),
+    ...(apiGetDiskUsage && { apiGetDiskUsage }),
+  });
+  const {
+    data,
+    loading,
+    error,
+    activeFamily,
+    setActiveFamily,
+    families,
+    familyData,
+    backends,
+    reload,
+  } = inv;
 
-  // health state keyed by engine id:
-  //   { [id]: { inflight: boolean, ok?: boolean, message?: string,
-  //              latency_ms?: number, lastClickAt?: number } }
-  const [healthByEngine, setHealthByEngine] = useState({});
-
-  useEffect(() => { setActiveFamily(family); }, [family]);
-
-  const reload = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const fresh = await apiListEngines();
-      setData(fresh);
-    } catch (e) {
-      const msg = e?.message || String(e);
-      setError(msg);
-      toast.error(t('engines.loadFailed', { message: msg }));
-    } finally {
-      setLoading(false);
-    }
-  }, [apiListEngines, t]);
-
-  useEffect(() => { reload(); }, [reload]);
-
-  const familyData = data?.[activeFamily];
-  const backends = useMemo(
-    () => (familyData?.backends || []).map(normalizeEntry),
-    [familyData],
-  );
-  const families = useMemo(
-    () => Object.keys(FAMILY_META).filter((f) => data?.[f]?.backends),
-    [data],
-  );
-
-  const testHealth = useCallback(async (id) => {
-    const now = Date.now();
-    const cur = healthByEngine[id];
-    if (cur?.inflight) return;
-    if (cur?.lastClickAt && now - cur.lastClickAt < TEST_COOLDOWN_MS) {
-      // Click-storm cooldown — silently ignore.
-      return;
-    }
-    setHealthByEngine((prev) => ({
-      ...prev,
-      [id]: { inflight: true, lastClickAt: now },
-    }));
-    try {
-      const result = await apiGetEngineHealth(id);
-      setHealthByEngine((prev) => ({
-        ...prev,
-        [id]: {
-          inflight: false,
-          ok: !!result.ok,
-          message: result.message || '',
-          latency_ms: Math.round(result.latency_ms || 0),
-          lastClickAt: now,
-        },
-      }));
-    } catch (e) {
-      setHealthByEngine((prev) => ({
-        ...prev,
-        [id]: {
-          inflight: false,
-          ok: false,
-          message: e?.message || String(e),
-          latency_ms: 0,
-          lastClickAt: now,
-        },
-      }));
-    }
-  }, [apiGetEngineHealth, healthByEngine]);
-
-  const COLUMNS = [
-    { key: 'name',       label: t('engines.matrixTitle').split(' ')[0] || 'Engine', flex: 3 },
-    { key: 'status',     label: t('engines.status'),     width: 130, align: 'center' },
-    { key: 'gpu',        label: 'GPU compat',            width: 170, align: 'left' },
-    { key: 'isolation',  label: 'Isolation',             width: 110, align: 'center' },
-    { key: 'action',     label: 'Actions',               width: 220, align: 'right' },
-  ];
+  // Which row the detail panel describes (null = none picked yet).
+  const [selectedId, setSelectedId] = useState(null);
+  const [diskOpenFor, setDiskOpenFor] = useState(null);
+  useEffect(() => {
+    setSelectedId(null); // a family switch starts from that family's active engine
+    setDiskOpenFor(null);
+  }, [activeFamily]);
 
   if (loading && !data) {
     return (
-      <section className="engine-matrix engine-matrix--loading" aria-busy="true">
-        <span className="engine-matrix__muted">{t('engines.loading')}</span>
+      <section className="engine-matrix flex flex-col items-center gap-2 p-4" aria-busy="true">
+        <span className="text-[13px] text-muted-foreground">{t('engines.loading')}</span>
       </section>
     );
   }
   if (error && !data) {
     return (
-      <section className="engine-matrix engine-matrix--error" role="alert">
-        <AlertTriangle size={14} /> {t('engines.couldNotLoad', { message: error })}
+      <section className="engine-matrix flex flex-col items-center gap-2 p-4" role="alert">
+        <AlertTriangle size={14} />{' '}
+        {t('engines.couldNotLoad', { message: error.message || String(error) })}
         <Button size="sm" variant="subtle" onClick={reload} leading={<RefreshCw size={11} />}>
           {t('engines.retry')}
         </Button>
@@ -210,16 +136,29 @@ export default function EngineCompatibilityMatrix({
   if (!familyData) return null;
 
   const activeBackendId = activeId ?? familyData.active;
+  const selected = backends.find((b) => b.id === selectedId) || null;
+  const toggleSelected = (id) => setSelectedId((cur) => (cur === id ? null : id));
+  const familyMeta = FAMILY_META[activeFamily] || FAMILY_META.tts;
+  const TitleIcon = showFamilyTabs ? Layers : familyMeta.icon;
+  const TitleHeading = catalogueLayout ? 'h2' : 'h3';
+  const LicenseDialog = inv.licenseDialogFor ? LICENSE_DIALOGS[inv.licenseDialogFor] : null;
 
   return (
-    <section className="engine-matrix">
-      <header className="engine-matrix__head">
-        <h3 className="engine-matrix__title">
-          <Layers size={14} /> {t('engines.matrixTitle')}
-        </h3>
+    <section className="engine-matrix flex min-h-0 flex-col gap-[18px] font-sans">
+      <header className="flex flex-wrap items-center justify-between gap-3 px-[2px]">
+        <TitleHeading className="m-0 inline-flex min-w-0 items-center gap-[10px] text-[length:var(--text-lg)] font-semibold text-foreground">
+          <span className="inline-flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-[10px] bg-[color-mix(in_srgb,var(--chrome-accent)_11%,transparent)] text-[var(--chrome-accent)]">
+            <TitleIcon size={15} aria-hidden="true" />
+          </span>
+          <span>
+            {showFamilyTabs
+              ? t('engines.matrixTitle')
+              : t('engines.familyMatrixTitle', { family: familyMeta.label })}
+          </span>
+        </TitleHeading>
         <Button
           size="sm"
-          variant="subtle"
+          variant="ghost"
           onClick={reload}
           loading={loading}
           leading={<RefreshCw size={11} />}
@@ -228,195 +167,277 @@ export default function EngineCompatibilityMatrix({
         </Button>
       </header>
 
-      {families.length > 1 && (
-        <Segmented
+      {showFamilyTabs && families.length > 1 && (
+        <Tabs
           size="sm"
+          variant="underline"
+          className="w-fit gap-[28px]"
           value={activeFamily}
-          onChange={setActiveFamily}
-          items={families.map((f) => ({
-            value: f,
-            title: t('engines.activeEngine', { family: FAMILY_META[f].label, engine: data[f].active }),
-            label: (
-              <span className="engine-matrix__tab-label">
-                <span className="engine-matrix__tab-family">{FAMILY_META[f].label}</span>
-                <span className="engine-matrix__tab-active">{data[f].active}</span>
-              </span>
-            ),
-          }))}
+          onChange={(f) => {
+            setActiveFamily(f);
+            onFamilyChange?.(f);
+          }}
+          items={families.map((f) => {
+            const FamilyIcon = FAMILY_META[f].icon;
+            return {
+              id: f,
+              title: t('engines.activeEngine', {
+                family: FAMILY_META[f].label,
+                engine: data[f].active,
+              }),
+              label: (
+                <span className="engine-matrix__tab-label inline-flex min-w-0 items-center justify-center gap-[6px] whitespace-nowrap px-[5px] py-[1px] leading-none">
+                  <FamilyIcon size={12} className="shrink-0 opacity-70" aria-hidden="true" />
+                  <span className="engine-matrix__tab-family text-[11px] font-bold tracking-[0.03em]">
+                    {FAMILY_META[f].label}
+                  </span>
+                </span>
+              ),
+            };
+          })}
         />
       )}
 
-      <Table className="engine-matrix__table" role="table" aria-label={t('engines.engineCompatLabel', { family: activeFamily })}>
-        <Table.Header columns={COLUMNS} />
-        <div className="engine-matrix__body" role="rowgroup">
-          {backends.map((b) => {
-            const isActive = b.id === activeBackendId;
-            const health = healthByEngine[b.id];
-            return (
-              <div
-                key={b.id}
-                role="row"
-                data-engine-id={b.id}
-                className={`engine-matrix__row ${b.available ? 'is-ok' : 'is-off'}`}
+      <p
+        className="m-0 max-w-[720px] px-[2px] text-[12px] leading-[1.55] text-muted-foreground"
+        data-testid={`family-desc-${activeFamily}`}
+      >
+        {t(`engines.familyDesc_${activeFamily}`)}
+      </p>
+
+      <div className="grid min-w-0 grid-cols-1 items-start gap-[24px] @min-[1100px]/catalogue-shell:grid-cols-[minmax(0,1fr)_380px]">
+        <Table
+          className="table-fixed border-collapse font-sans"
+          aria-label={t('engines.engineCompatLabel', { family: activeFamily })}
+          data-testid="engine-list"
+        >
+          <TableHeader className="[&_tr]:border-border [&_tr]:hover:bg-transparent">
+            <TableRow role="row">
+              <TableHead scope="col" className={cn('h-8 px-3', LABEL)}>
+                {t('engines.colEngine')}
+              </TableHead>
+              <TableHead scope="col" style={{ width: 104 }} className={cn('h-8 px-3', LABEL)}>
+                {t('engines.colRunsOn')}
+              </TableHead>
+              <TableHead scope="col" style={{ width: 132 }} className={cn('h-8 px-3', LABEL)}>
+                {t('engines.status')}
+              </TableHead>
+              <TableHead
+                scope="col"
+                style={{ width: 132 }}
+                className={cn('h-8 px-3 text-right', LABEL)}
               >
-                {/* Engine name + reason / install_hint */}
-                <div role="cell" className="engine-matrix__cell engine-matrix__cell--name" style={{ flex: 3 }}>
-                  <span className="engine-matrix__name">
-                    {b.display_name}
-                    {isActive && <Badge tone="brand" size="xs">{t('engines.active')}</Badge>}
-                  </span>
-                  <code className="engine-matrix__id">{b.id}</code>
-                  {/* For available rows, show install_hint inline (one line — usually
-                      a parenthetical like "(bundled — no extra install needed)").
-                      For unavailable rows, collapse reason + install_hint + last_error
-                      into a single disclosure so unavailable rows don't dwarf the matrix. */}
-                  {b.available && b.install_hint && (
-                    <span className="engine-matrix__hint" title={b.install_hint}>
-                      {b.install_hint}
-                    </span>
+                <span className="sr-only">{t('engines.colActions')}</span>
+              </TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody data-testid="engine-list-scroll">
+            {backends.map((b, index) => {
+              const isActive = b.id === activeBackendId;
+              const isSelected = selected?.id === b.id;
+              const resident = inv.loadedByEngine[b.id] || null;
+              const install = inv.installByEngine[b.id] || null;
+              const installJob = install?.job || null;
+              const installRunning = installJob?.state === 'running';
+              const device = runsOn(t, b);
+              const status = statusOf(t, b, install);
+              const panelId = `engine-detail-${b.id}`;
+              const caption =
+                index === 0 || (backends[index - 1]?.available && !b.available)
+                  ? b.available
+                    ? t('engines.sectionReady')
+                    : t('engines.sectionMore')
+                  : null;
+              return (
+                <React.Fragment key={b.id}>
+                  {caption && (
+                    <TableRow role="row" className="border-0 hover:bg-transparent">
+                      <TableCell colSpan={4} className={cn('px-3 pb-1 pt-4', LABEL)}>
+                        {caption}
+                      </TableCell>
+                    </TableRow>
                   )}
-                  {!b.available && (b.reason || b.install_hint || b.last_error) && (
-                    <details className="engine-matrix__why">
-                      <summary className="engine-matrix__why-summary">{t('engines.whyUnavailable')}</summary>
-                      <div className="engine-matrix__why-body">
-                        {b.reason && (
-                          <span className="engine-matrix__reason">{b.reason}</span>
+                  <TableRow
+                    role="row"
+                    data-engine-id={b.id}
+                    data-state={isSelected ? 'selected' : undefined}
+                    aria-selected={isSelected}
+                    onClick={() => setSelectedId(b.id)}
+                    className={cn(
+                      'group cursor-pointer border-border/70',
+                      isActive && 'shadow-[inset_2px_0_0_var(--chrome-accent)]',
+                    )}
+                  >
+                    <TableCell className="px-3 py-[9px]">
+                      <span className="flex min-w-0 items-center gap-2">
+                        <EngineMark
+                          id={b.id}
+                          size={18}
+                          className={cn('shrink-0', !b.available && 'opacity-60')}
+                        />
+                        <button
+                          type="button"
+                          className={cn(
+                            'min-w-0 cursor-pointer truncate border-0 bg-transparent p-0 text-left text-sm font-medium leading-[1.3] hover:text-accent focus-visible:outline-none focus-visible:shadow-[var(--focus-ring)]',
+                            b.available ? 'text-foreground' : 'text-muted-foreground',
+                          )}
+                          title={b.display_name}
+                          aria-expanded={isSelected}
+                          aria-controls={panelId}
+                          data-testid={`why-toggle-${b.id}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            toggleSelected(b.id);
+                          }}
+                        >
+                          {b.display_name}
+                        </button>
+                        {isActive && (
+                          <Badge tone="brand" size="xs" className="shrink-0">
+                            {t('engines.active')}
+                          </Badge>
                         )}
-                        {b.install_hint && b.install_hint !== b.reason && (
-                          <span className="engine-matrix__hint">{b.install_hint}</span>
+                        {resident && (
+                          <Badge
+                            tone="info"
+                            size="xs"
+                            className="shrink-0"
+                            title={t('engines.inMemoryTitle')}
+                            data-testid={`resident-${b.id}`}
+                          >
+                            {t('engines.inMemory')}
+                          </Badge>
                         )}
-                        {b.last_error && b.last_error !== b.reason && (
-                          <span className="engine-matrix__last-error" data-testid="last-error">
-                            {t('engines.lastError', { error: b.last_error })}
+                        {activeFamily === 'tts' && b.supports_cloning && (
+                          <span
+                            className="inline-flex shrink-0 text-muted-foreground"
+                            title={t('engines.cloneCapableTitle')}
+                            data-testid={`clone-badge-${b.id}`}
+                          >
+                            <Mic size={11} aria-hidden="true" />
+                            <span className="sr-only">{t('engines.cloneCapable')}</span>
                           </span>
                         )}
-                      </div>
-                    </details>
-                  )}
-                </div>
-
-                {/* Install state */}
-                <div
-                  role="cell"
-                  className="engine-matrix__cell engine-matrix__cell--center"
-                  style={{ width: 130 }}
-                  title={b.available ? t('engines.installedAndReady') : (b.reason || t('engines.notInstalled'))}
-                >
-                  {b.available
-                    ? <Badge tone="success" size="xs"><CheckCircle2 size={10} /> {t('engines.available')}</Badge>
-                    : <Badge tone="warn" size="xs"><AlertTriangle size={10} /> {t('engines.unavailable')}</Badge>}
-                </div>
-
-                {/* GPU compat chips */}
-                <div role="cell" className="engine-matrix__cell engine-matrix__cell--gpu" style={{ width: 170 }}>
-                  <div className="engine-matrix__chips">
-                    {b.gpu_compat.map((g) => (
-                      <span key={g} className={`engine-matrix__chip engine-matrix__chip--${g}`}>
-                        {GPU_LABEL[g] || g.toUpperCase()}
+                        <ChevronRight
+                          size={12}
+                          aria-hidden="true"
+                          className={cn(
+                            'ml-auto shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-60',
+                            isSelected && 'opacity-60',
+                          )}
+                        />
                       </span>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Isolation mode */}
-                <div
-                  role="cell"
-                  className="engine-matrix__cell engine-matrix__cell--center"
-                  style={{ width: 110 }}
-                  title={b.isolation_mode === 'subprocess'
-                    ? t('engines.subprocessTitle')
-                    : t('engines.inProcessTitle')}
+                    </TableCell>
+                    <TableCell
+                      className={cn(
+                        'px-3 py-[9px] font-mono text-[11px] uppercase',
+                        device.muted ? 'text-muted-foreground/70' : 'text-foreground',
+                      )}
+                      title={b.routing_reason || undefined}
+                      data-testid={`runs-on-${b.id}`}
+                    >
+                      {device.text}
+                    </TableCell>
+                    <TableCell
+                      className={cn('px-3 py-[9px] text-xs', status.cls)}
+                      title={b.available ? b.routing_reason || undefined : b.reason || undefined}
+                    >
+                      {status.text}
+                    </TableCell>
+                    <TableCell
+                      className="px-3 py-[6px] text-right"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      {onSelect && b.available && !isActive && (
+                        <Button
+                          size="sm"
+                          variant="subtle"
+                          onClick={() => inv.selectEngine(b.id)}
+                          aria-label={t('engines.ariaUse', { engine: b.display_name })}
+                        >
+                          {t('engines.use')}
+                        </Button>
+                      )}
+                      {/* Hidden while a license review is all that is left: the
+                          engine is installed, and Accept (in the panel) is next. */}
+                      {!b.available && b.one_click_install && !reasonMentionsLicense(b.reason) && (
+                        <Button
+                          size="sm"
+                          variant="subtle"
+                          onClick={() => {
+                            setSelectedId(b.id); // progress renders in the panel
+                            inv.startInstall(b.id);
+                          }}
+                          disabled={installRunning}
+                          loading={installRunning}
+                          leading={!installRunning && <Download size={11} />}
+                          data-testid={`install-${b.id}`}
+                          aria-label={t('engines.installAria', { engine: b.display_name })}
+                        >
+                          {installRunning
+                            ? t('engines.installing')
+                            : installJob?.state === 'failed'
+                              ? t('engines.retryInstall')
+                              : t('engines.install')}
+                        </Button>
+                      )}
+                    </TableCell>
+                  </TableRow>
+                </React.Fragment>
+              );
+            })}
+            {backends.length === 0 && (
+              <TableRow role="row">
+                <TableCell
+                  colSpan={4}
+                  className="p-6 text-center text-[13px] text-muted-foreground"
                 >
-                  <Badge tone={ISOLATION_TONE[b.isolation_mode] || 'neutral'} size="xs">
-                    {b.isolation_mode}
-                  </Badge>
-                </div>
+                  {t('engines.noBackends')}
+                </TableCell>
+              </TableRow>
+            )}
+          </TableBody>
+        </Table>
 
-                {/* Actions: Test engine + optional Use.
-                    "Test engine" is hidden on unavailable rows by default —
-                    a health check on a known-unavailable engine just confirms
-                    what the matrix already says. Users re-checking after a
-                    manual install can hit "Re-check" inside the disclosure. */}
-                <div
-                  role="cell"
-                  className="engine-matrix__cell engine-matrix__cell--actions"
-                  style={{ width: 220 }}
-                >
-                  {b.available && (
-                    <Button
-                      size="sm"
-                      variant="subtle"
-                      onClick={() => testHealth(b.id)}
-                      disabled={!!health?.inflight}
-                      loading={!!health?.inflight}
-                      leading={!health?.inflight && <Activity size={11} />}
-                      aria-label={`Test ${b.display_name}`}
-                    >
-                      {health?.inflight ? t('engines.testing') : t('engines.testEngine')}
-                    </Button>
-                  )}
-                  {!b.available && (
-                    <Button
-                      size="sm"
-                      variant="subtle"
-                      onClick={() => testHealth(b.id)}
-                      disabled={!!health?.inflight}
-                      loading={!!health?.inflight}
-                      leading={!health?.inflight && <RefreshCw size={11} />}
-                      aria-label={`Re-check ${b.display_name}`}
-                    >
-                      {health?.inflight ? t('engines.rechecking') : t('engines.recheck')}
-                    </Button>
-                  )}
-                  {health && !health.inflight && (
-                    <span
-                      className={`engine-matrix__result engine-matrix__result--${health.ok ? 'ok' : 'fail'}`}
-                      data-testid={`health-result-${b.id}`}
-                      title={health.message}
-                    >
-                      {health.ok
-                        ? t('engines.latencyMs', { ms: health.latency_ms })
-                        : t('engines.failed')}
-                    </span>
-                  )}
-                  {onSelect && b.available && !isActive && (
-                    <Button
-                      size="sm"
-                      variant="subtle"
-                      onClick={() => onSelect(activeFamily, b.id)}
-                      aria-label={`Use ${b.display_name}`}
-                    >
-                      {t('engines.use')}
-                    </Button>
-                  )}
-                  {/* TTS-05: license-acceptance entry point. Surfaced when
-                      the backend says the user hasn't accepted the
-                      engine's license yet AND we have a dialog
-                      registered for that engine id. */}
-                  {!b.available
-                    && reasonMentionsLicense(b.reason)
-                    && LICENSE_DIALOGS[b.id]
-                    && (
-                      <Button
-                        size="sm"
-                        variant="subtle"
-                        onClick={() => setLicenseDialogFor(b.id)}
-                        aria-label={`Review and accept ${b.display_name} license`}
-                      >
-                        {t('engines.acceptLicense')}
-                      </Button>
-                    )}
-                </div>
-              </div>
-            );
-          })}
-          {backends.length === 0 && (
-            <div className="engine-matrix__empty" role="row">
-              <span role="cell">{t('engines.noBackends')}</span>
-            </div>
-          )}
-        </div>
-      </Table>
+        {!selected && (
+          <aside
+            data-testid="engine-detail-empty"
+            className="flex min-h-[120px] items-center justify-center rounded-[14px] border border-dashed border-border p-[16px] text-center text-xs leading-[1.5] text-muted-foreground"
+          >
+            {t('engines.selectHint')}
+          </aside>
+        )}
+        {selected && (
+          <EngineDetail
+            b={selected}
+            family={activeFamily}
+            isActive={selected.id === activeBackendId}
+            inv={inv}
+            onSelect={onSelect}
+            t={t}
+            i18n={i18n}
+            weights={weights}
+            downloads={downloads}
+            diskOpen={diskOpenFor === selected.id}
+            onToggleDisk={() => {
+              const next = diskOpenFor === selected.id ? null : selected.id;
+              setDiskOpenFor(next);
+              if (next && !inv.diskByEngine[selected.id]) inv.loadDiskUsage(selected.id);
+            }}
+          />
+        )}
+      </div>
+
+      {LicenseDialog && (
+        <LicenseDialog
+          open
+          onClose={() => inv.setLicenseDialogFor(null)}
+          onAccepted={() => {
+            inv.setLicenseDialogFor(null);
+            reload();
+          }}
+        />
+      )}
     </section>
   );
 }

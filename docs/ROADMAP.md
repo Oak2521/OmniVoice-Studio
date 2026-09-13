@@ -1,4 +1,4 @@
-# OmniVoice Studio — Road to World-Class
+# VoiceStudio — Road to World-Class
 
 **Last updated:** 2026-04-21 · **Current phase:** Phases 0–4 complete. Remaining work sits in Design / Performance / Quality tracks + the Phase 4 eval sprint. · **Resourcing:** 1 FTE + ad-hoc
 
@@ -17,8 +17,8 @@ Phase 4 · The two bets            ▓▓▓▓▓▓▓▓▓▓  6 / 6     ✅
 Phase 5 · Productisation          ░░░░░░░░░░  0 / 5     🚫 demand-driven
 
 Design track        ▓▓▓▓▓▓▓▓▓░  ongoing · 14 primitives + ~67 migrated inline styles · DubTab/Header/Sidebar/CloneDesignTab drained
-Performance track   ░░░░░░░░░░  not started
-Feature-magic track ░░░░░░░░░░  not started
+Performance track   ▓▓▓░░░░░░░  underway · profiling, preload, isolated engines + cache-remix I/O
+Feature-magic track ▓▓░░░░░░░░  underway · project-level casting board shipped
 Quality track       ▓▓░░░░░░░░  12 smoke tests, 10 error messages rewritten
 ```
 
@@ -53,7 +53,7 @@ Together they compose: directorial edits trigger incremental re-dubs. That's the
 ⏳ Quality ceiling unchanged — one-shot translation, raw WhisperX segments, no speech-rate adaptation. **This is what Phase 1 fixes.**
 ⏳ UX ceiling — motion language, error messages, onboarding: partial. Launch animation shipped; error messages rewritten (10 sites); onboarding + sample clip still pending.
 
-See [`research/LEARNINGS.md`](research/LEARNINGS.md) for the competitor analysis this roadmap is built on · [`STRUCTURE.md`](STRUCTURE.md) for file layout · [`design/`](design/) for target-state ASCII mockups.
+See [`STRUCTURE.md`](STRUCTURE.md) for file layout. (The competitor analysis `research/LEARNINGS.md` and the `design/` ASCII mockups this roadmap was built on were removed in the 2026-07-12 root cleanup — git history.)
 
 ---
 
@@ -114,7 +114,7 @@ Progress: **7/8 (88 %)** · Phase 2.5 has overshot expectations thanks to the de
 | 2.5 | Design-system primitives | ✅ | **MASSIVELY overshot.** 14 primitives: Button, Panel, Field/Input/Textarea/Select, Dialog, Slider, Badge, Tabs, Segmented, Tooltip, Progress, Menu, Table. 9 components migrated. Inline-style migration (separate design-track row) has since drained DubTab (93→2), Header (24→1), Sidebar (21→8), CloneDesignTab (33→0). Sessions ran 2026-04-19 → 2026-04-21. |
 | 2.6 | Logging + telemetry baseline | ✅ | Shipped 2026-04-21. `print()` sweep in `services/model_manager.py` — all four calls now use `logger.info` (model load, torch.compile apply/skip, idle unload). New `OMNIVOICE_JSON_LOGS=1` env flag swaps every handler to a single-line JSON formatter (verified: `{"t": "...", "level": "INFO", "name": "omnivoice.api", "msg": "..."}`), including the rotating file handler. Per-stage Prometheus counters at `/metrics` deferred — land when a real observability need arises. |
 | 2.7 | Test floor ("every bug ships a regression test") | ✅ | Shipped 2026-04-21. New `tests/test_dub_pipeline_state.py` (8 tests — path safety, SSE shape, process tracking, in-memory + disk job round-trip) + `tests/test_translator.py` (5 tests — glossary preamble, no-LLM graceful fallback, empty-literal passthrough, full 3-step chain with mocked LLM, reflect-failure path). Total backend tests: **50** (up from 26) passing in 3.10 s. Integration tests covering the GPU / ASR model path stay out of CI — those are manual fixture-clip runs. |
-| 2.8 | Voice profile page | ✅ | Shipped 2026-04-21. New `mode: 'voice'` + `activeVoiceId` in `App.jsx`; lazy-loaded `frontend/src/pages/VoiceProfile.{jsx,css}` (hero + details + try-it + usage). Backend: new `GET /profiles/{id}`, `PUT /profiles/{id}`, `GET /profiles/{id}/usage` (scans `studio_projects.state_json` for dub-segment counts). Sidebar gets an "Open" action on clone/design cards that routes here; Back returns to the previous mode. Design target: [`design/03-voice-library.md`](design/03-voice-library.md). |
+| 2.8 | Voice profile page | ✅ | Shipped 2026-04-21. New `mode: 'voice'` + `activeVoiceId` in `App.jsx`; lazy-loaded `frontend/src/pages/VoiceProfile.{jsx,css}` (hero + details + try-it + usage). Backend: new `GET /profiles/{id}`, `PUT /profiles/{id}`, `GET /profiles/{id}/usage` (scans `studio_projects.state_json` for dub-segment counts). Sidebar gets an "Open" action on clone/design cards that routes here; Back returns to the previous mode. Design target: `design/03-voice-library.md` (retired 2026-07-12; git history). |
 
 **Exit criteria:** server can restart mid-dub without losing work. Frontend type-checks. No router file >300 lines. App.jsx ≤300 lines. CI blocks regressions.
 
@@ -128,8 +128,8 @@ Progress: **4/4 (100 %)**
 
 | ID | Item | Status | Notes |
 |----|------|:---:|------|
-| 3.1 | TTS adapter interface | ✅ | Shipped 2026-04-21. `backend/services/tts_backend.py` — `TTSBackend` ABC + registry, `OmniVoiceBackend` wrapping the current model (zero behaviour change; reuses `model_manager.get_model()` so no double load), `list_backends()` with per-engine availability reasons, env-driven selection via `OMNIVOICE_TTS_BACKEND`. |
-| 3.2 | Alternative TTS backends (VoxCPM2 + MOSS-TTS-Nano) | ✅ | Shipped 2026-04-21 / 2026-04-20. **VoxCPM2**: GPU studio pick, 30 langs, 48 kHz, `"(instruct)prompt"` syntax wired from OmniVoice's `instruct`. **MOSS-TTS-Nano-100M** added 2026-04-20 as the low-resource / broad-language pick — 100M-param autoregressive, 20 langs (incl. Arabic/Hebrew/Persian/Korean/Turkish), realtime on 4-core CPU, native 48 kHz stereo, Apache-2.0. Both `is_available()` return actionable install hints when deps are missing. **Runtime picker**: `POST /engines/select` + `backend/core/prefs.py` (atomic JSON store); Settings > Engines tab has **Use** buttons per family; env vars still override. 14 engine tests pass. |
+| 3.1 | TTS adapter interface | ✅ | Shipped 2026-04-21. `backend/services/tts_backend.py` — `TTSBackend` ABC + registry, `VoiceStudioBackend` wrapping the current model (zero behaviour change; reuses `model_manager.get_model()` so no double load), `list_backends()` with per-engine availability reasons, env-driven selection via `OMNIVOICE_TTS_BACKEND`. |
+| 3.2 | Alternative TTS backends (VoxCPM2 + MOSS-TTS-Nano) | ✅ | Shipped 2026-04-21 / 2026-04-20. **VoxCPM2**: GPU studio pick, 30 langs, 48 kHz, `"(instruct)prompt"` syntax wired from VoiceStudio's `instruct`. **MOSS-TTS-Nano-100M** added 2026-04-20 as the low-resource / broad-language pick — 100M-param autoregressive, 20 langs (incl. Arabic/Hebrew/Persian/Korean/Turkish), realtime on 4-core CPU, native 48 kHz stereo, Apache-2.0. Both `is_available()` return actionable install hints when deps are missing. **Runtime picker**: `POST /engines/select` + `backend/core/prefs.py` (atomic JSON store); Settings > Engines tab has **Use** buttons per family; env vars still override. 14 engine tests pass. |
 | 3.3 | ASR adapter interface | ✅ | Shipped 2026-04-21. `backend/services/asr_backend.py` — `ASRBackend` ABC, `MLXWhisperBackend` (Apple Silicon, current default), `PyTorchWhisperBackend` (CUDA / CPU fallback using the TTS model's `_asr_pipe`). `active_backend_id()` auto-detects based on `torch.backends.mps` availability; override with `OMNIVOICE_ASR_BACKEND`. |
 | 3.4 | LLM adapter | ✅ | Shipped 2026-04-21. `backend/services/llm_backend.py` — `LLMBackend` ABC, `OpenAICompatBackend` (lifts the Ollama/OpenAI client out of `translator.py` so glossary auto-extract + future Directorial AI share one code path), `OffBackend` (explicit no-LLM with a copy-paste env-var hint). Privacy default honoured: Cloud LLMs opt-in per-feature, never required. |
 
@@ -141,7 +141,7 @@ Progress: **4/4 (100 %)**
 
 ## 🎛️ Phase 4 — The two bets land _(shipped 2026-04-21 → ✅)_
 
-> *The defining phase. This is why someone chooses OmniVoice over everything else. Built on Phase 2's persistent job store and Phase 3's adapters.*
+> *The defining phase. This is why someone chooses VoiceStudio over everything else. Built on Phase 2's persistent job store and Phase 3's adapters.*
 
 Progress: **6/6 ✅** (both bets wired end-to-end; review banners + step-level resumability live)
 
@@ -193,37 +193,37 @@ None on the critical path to world-class. All are answers to real demand.
 | Design-system primitives (14) | ✅ | Full inventory above. |
 | Migrate remaining inline styles | 🟡 | **Four biggest offenders drained 2026-04-20** — DubTab **93 → 2**, Header **24 → 1**, Sidebar **21 → 8**, CloneDesignTab **33 → 0**. All remaining are genuinely dynamic (per-row `--row-accent` CSS custom props in Sidebar, per-bar `height/animationDelay` in WaveBars, `opacity` computed from index in skeleton rows, `fontSize` by prop). New class systems: `.dub-*` (DubTab), `.hq-col-*/.hq-stats__*/.hq-logo-*` (Header), `.sidebar-tile--*/.sidebar__scroll/.history-*--*` (Sidebar), `.clone-*/.label-row--*` (CloneDesignTab). Drag-hover on `.file-drag` and `.dub-idle-drop` now toggles `.is-dragging` instead of mutating styles via DOM. Remaining 119 across the tail (Launchpad, KeyboardCheatsheet, DubSegmentRow, WaveformTimeline, etc.) — less concentrated, lower-leverage. |
 
-### ⚡ Performance track _(⏳ not started)_
+### ⚡ Performance track _(🟡 underway)_
 
 | Item | Status | Current measurement |
 |------|:---:|------|
-| Batched TTS (8–16 segments per forward pass) | ⏳ | 1 segment per call today. |
-| Kill per-segment disk round-trip | ⏳ | `dub_generate.py:132-133` saves + re-reads per segment. |
-| Cold start ≤1.5 s to first audible sample | ⏳ | Currently 4+ s on Apple Silicon. |
+| Batched TTS (host-derived width per forward pass) | 🟡 | The batch queue feeds OmniVoice's native variable-length forward pass, with the width derived from device headroom (1 on CPU/low-VRAM hosts, up to 8) and overridable via `OMNIVOICE_DUB_BATCH_WIDTH`; adapters without native batching retain the single-segment fallback. |
+| Kill per-segment disk round-trip | 🟡 | Long-video assembly stays disk-backed to bound RAM. Unchanged same-rate natural segments now skip the redundant decode → scratch encode → decode cycle; fresh segments still persist once and reload for assembly. |
+| Cold start ≤1.5 s to first audible sample | 🟡 | Installed models preload in the background and `scripts/bench_pipeline.py` measures cold/warm synthesis; target is not yet verified. |
 | Speculative regeneration on hover | ⏳ | — |
-| Crash-sandbox engines (subprocess isolation) | ⏳ | Single CUDA OOM still kills server. |
-| Interaction budgets (<50 ms UI, <200 ms preview, <4 s first seg) | ⏳ | Not measured. |
+| Crash-sandbox engines (subprocess isolation) | 🟡 | Killable sidecar engines and opt-in `omnivoice-subprocess` are live; the default OmniVoice engine now routes through the crash sandbox on MPS, while CUDA/ROCm/CPU retain the lower-overhead in-process path. |
+| Interaction budgets (<50 ms UI, <200 ms preview, <4 s first seg) | 🟡 | `/ws/tts` reports real TTFA, total generation time and RTF; frontend responsiveness instrumentation exists, but no cross-surface budget gate yet. |
 | Dedicated dev-week per quarter | ⏳ | Cadence not yet booked. |
 
-### ✨ Feature-magic track _(⏳ not started)_
+### ✨ Feature-magic track _(🟡 underway)_
 
 | Feature | Status | Phase gate |
 |------|:---:|------|
-| Project-level casting view (drag voices to speakers) | ⏳ | After Phase 3 |
+| Project-level casting view (drag voices to speakers) | ✅ | Shipped (#1767): the dub CAST strip expands into a casting board — drag voice chips onto speaker rows, keyboard listbox included, same fields as the dropdowns. |
 | Voice memory across projects | ⏳ | After Phase 4 |
 | Context-aware pipeline (video frames → pipeline decisions) | ⏳ | After Phase 4 |
 | On-device learning from corrections (user edits → LoRA) | ⏳ | Research only; possibly Phase 5+ |
-| Real-time dub preview (stream TTS as you edit) | ⏳ | After Phase 4.1 |
+| Real-time dub preview (stream TTS as you edit) | ✅ | Shipped 2026-09-02 (#1769) — opt-in "Live preview" toggle on the dub segment table streams the edited line over `/ws/tts` with its CAST voice; export path unchanged. |
 
 ### 🧪 Quality track _(🟡 underway)_
 
 | Item | Status | Notes |
 |------|:---:|------|
 | Every bug ships a regression test | ⏳ | Rule written, not yet enforced in CI. |
-| Perf regression budget (≤5 % on fixture clip) | ⏳ | No fixture clip yet. |
+| Perf regression budget (≤5 % on fixture clip) | ✅ | Shipped 2026-08-20 as hardware-independent **operation-count budgets** (`tests/test_perf_operation_budgets.py`) — stricter than 5 %, and CI-stable where wall-clock on varying runners is not: one generate per sentence on `/ws/tts`, zero TTS calls on cached dub re-mixes; zero decode/rewrite and ⌈N/W⌉ `generate_batch` guards activate with their respective fast paths. See docs/performance.md §Performance budgets. |
 | Accessibility (keyboard-first, WCAG AA, ARIA live regions) | 🟡 | Focus rings token defined; full audit pending. |
 | Privacy (zero telemetry by default, per-feature opt-in) | ✅ | Enforced in Settings → Privacy tab. |
-| Docs updated per phase | 🟡 | STRUCTURE.md, ROADMAP.md, ui/README.md, research/LEARNINGS.md, design/*.md all current. |
+| Docs updated per phase | 🟡 | STRUCTURE.md, ROADMAP.md, ui/README.md current (research/ + design/ retired 2026-07-12). |
 
 ---
 
@@ -349,7 +349,7 @@ TTS is 99 % of the budget. Cache load (29 WAVs), timeline mix (30 segments with 
 
 ### 2026-04-21 — Phase 4.1 benchmarked on fireship clip: **7.05 s, MISS by 2 s**
 
-First real measurement of the Phase 4.1 exit criterion. Fixture: `https://www.youtube.com/watch?v=ZzI9JE0i6Lc` (fireship clip, ~3 min, 489 transcribed segments — capped to first 30 for tractable baseline). Apple Silicon MPS, OmniVoice default engine.
+First real measurement of the Phase 4.1 exit criterion. Fixture: `https://www.youtube.com/watch?v=ZzI9JE0i6Lc` (fireship clip, ~3 min, 489 transcribed segments — capped to first 30 for tractable baseline). Apple Silicon MPS, VoiceStudio default engine.
 
 | Stage | Wall-clock |
 |---|---|
@@ -494,7 +494,7 @@ Bundle: main bundle 229.31 kB → 230.20 kB (+0.89 kB for two new lazy pages; ne
 
 All four adapter interfaces shipped in one sitting, with tests + HTTP surface.
 
-- **3.1 TTS** — new `backend/services/tts_backend.py`. `TTSBackend` ABC, `OmniVoiceBackend` wrapping `k2-fsa/OmniVoice` (reuses `model_manager.get_model()` so no double load), env-driven selection (`OMNIVOICE_TTS_BACKEND`, default `omnivoice`). `list_backends()` returns `[{id, display_name, available, reason}]` so the Settings-UI picker can grey out unavailable engines with actionable reasons.
+- **3.1 TTS** — new `backend/services/tts_backend.py`. `TTSBackend` ABC, `VoiceStudioBackend` wrapping `k2-fsa/OmniVoice` (reuses `model_manager.get_model()` so no double load), env-driven selection (`OMNIVOICE_TTS_BACKEND`, default `omnivoice`). `list_backends()` returns `[{id, display_name, available, reason}]` so the Settings-UI picker can grey out unavailable engines with actionable reasons.
 - **3.2 VoxCPM2** — `VoxCPM2Backend` in the same file. Scaffold returns an actionable "install voxcpm + need CUDA" message until deps are present; when they are, `generate()` maps our `instruct` field onto VoxCPM2's inline `"(instruct)prompt"` syntax and supports ultimate cloning (ref_audio + ref_text). 48 kHz, 30 advertised languages.
 - **3.3 ASR** — new `backend/services/asr_backend.py`. `MLXWhisperBackend` (default on Apple Silicon) + `PyTorchWhisperBackend` (CUDA/CPU fallback reusing the TTS model's `_asr_pipe`). Auto-detects best engine based on `torch.backends.mps`; override via `OMNIVOICE_ASR_BACKEND`. Both normalise to the `chunks` shape existing code already consumes.
 - **3.4 LLM** — new `backend/services/llm_backend.py`. `OpenAICompatBackend` lifts the client construction out of `translator.py` so every LLM-using feature (Cinematic translate, glossary auto-extract, Phase-4 Directorial AI) goes through one code path. `OffBackend` provides an explicit no-LLM state with a clear "set TRANSLATE_BASE_URL" hint; defaults to `off` when nothing's configured.
@@ -596,7 +596,7 @@ Closes Phase 1.
 
 - New `backend/services/translator.py` — 3-step LLM chain (literal result passed in → LLM reflects on tone/idiom/length/pacing → LLM adapts). Bounded concurrency via `OMNIVOICE_LLM_CONCURRENCY` (default 6). Per-segment graceful fallback to literal on LLM failure.
 - `TranslateRequest` gains `quality: "fast"|"cinematic"` and `glossary: [{source, target, note}]`. Glossary, when provided, is prepended to both reflect and adapt prompts.
-- `POST /dub/translate` response gains `quality_used`, and per-segment `literal` + `critique` when Cinematic ran — set up for the Phase-1.3 three-column Translation Workbench view (see [`design/04-translation-workbench.md`](design/04-translation-workbench.md)).
+- `POST /dub/translate` response gains `quality_used`, and per-segment `literal` + `critique` when Cinematic ran — set up for the Phase-1.3 three-column Translation Workbench view (see `design/04-translation-workbench.md` (retired 2026-07-12; git history)).
 - Frontend: `translateQuality` state in `App.jsx` (localStorage-persisted), new `Segmented` control in DubTab settings bar, toast on `cinematic_skipped="no-llm-configured"` pointing to the env vars.
 - Works with real OpenAI, Ollama, LM Studio, Together, Anyscale — anything OpenAI-compatible. Env: `TRANSLATE_BASE_URL`, `TRANSLATE_API_KEY` (or `OPENAI_API_KEY`), `TRANSLATE_MODEL` (default `gpt-4o-mini`), `OMNIVOICE_LLM_TIMEOUT` (default 45 s).
 - Smoke suite still green: 12 / 12 in 2.85 s.
@@ -617,7 +617,7 @@ Closes Phase 1.
 
 ### 2026-04-20 — Research + design docs
 
-Documented `research/LEARNINGS.md` (competitor analysis: VideoLingo, pyVideoTrans, VoxCPM2), wrote the `design/` ASCII mockup set (architecture + 8 views), drafted v1 ROADMAP.md, published STRUCTURE.md after root cleanup.
+Documented `research/LEARNINGS.md` (competitor analysis: VideoLingo, pyVideoTrans, VoxCPM2), wrote the `design/` ASCII mockup set (architecture + 8 views), drafted v1 ROADMAP.md, published STRUCTURE.md after root cleanup. (Both dirs retired in the 2026-07-12 cleanup — git history.)
 
 ### Pre-2026-04-20
 
@@ -627,7 +627,7 @@ MVP feature-complete: transcribe → translate → dub → mux, voice cloning, t
 
 ## 🧭 Design target
 
-Intended shape captured in [`design/`](design/) — one ASCII mockup per view, plus a system-architecture diagram. Every phase brings the shipped product one step closer to what those views describe. When code and design diverge, one of them is wrong — decide which, then fix it.
+Intended shape captured in `design/` (retired 2026-07-12; git history) — one ASCII mockup per view, plus a system-architecture diagram. Every phase brings the shipped product one step closer to what those views describe. When code and design diverge, one of them is wrong — decide which, then fix it.
 
 ---
 

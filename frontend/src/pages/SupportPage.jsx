@@ -1,211 +1,451 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
-  Heart, ExternalLink, ArrowLeft, Building2,
-  Shield, Zap, Users, Headphones, Code, Globe, Mail,
-  Star, MessageCircle,
+  Heart,
+  ExternalLink,
+  ArrowLeft,
+  Building2,
+  Shield,
+  Zap,
+  Headphones,
+  Mail,
+  Star,
+  MessageCircle,
+  Gem,
 } from 'lucide-react';
-import { Button } from '../ui';
+import { Button, Badge, Tabs } from '../ui';
+import { Card } from '@/components/ui/card';
 import { openExternal } from '../api/external';
-import './DonatePage.css';
-import './EnterprisePage.css';
-import './SupportPage.css';
+import GoalBar from '../components/donate/GoalBar';
+import { loadDonationProgress, BUNDLED_PROGRESS } from '../api/donation';
 
-const METHODS = [
-  { id: 'github', label: 'GitHub Sponsors', descriptionKey: 'donate.github_desc', url: 'https://github.com/debpalash', icon: '🐙' },
-  { id: 'kofi', label: 'Ko-fi', descriptionKey: 'donate.coffee_desc', url: 'https://ko-fi.com/debpalash', icon: '☕' },
-  { id: 'paypal', label: 'PayPal', descriptionKey: 'donate.paypal_desc', url: 'https://paypal.me/palashCoder', icon: '💳' },
+// Ko-fi / PayPal destinations are shared with the footer's donation-moment
+// popover — single source of truth in utils/donateLinks.js.
+import { KOFI_URL, PAYPAL_URL } from '../utils/donateLinks';
+// Sponsor roster + "become a sponsor" links — single source of truth in
+// config/sponsors.js (kept in lockstep with SPONSORS.md).
+import { SPONSORS, SPONSOR_TIERS, SPONSOR_CONTACT } from '../config/sponsors';
+import { ContactSections } from './ContactPage';
+
+const VIEWS = ['support', 'license', 'contact'];
+const viewFromRoute = (view) => (VIEWS.includes(view) ? view : 'support');
+// Suggested amounts — ladder starts at $10; middle ($20) is "most common".
+const SUGGESTED_AMOUNTS = [
+  { value: 10, label: '$10' },
+  { value: 20, label: '$20', common: true },
+  { value: 50, label: '$50' },
 ];
 
-function LinkCard({ method, style }) {
-  const { t } = useTranslation();
+const METHODS = [
+  { id: 'kofi', label: 'Ko-fi', url: KOFI_URL, icon: '☕' },
+  { id: 'paypal', label: 'PayPal', url: PAYPAL_URL, icon: '💳' },
+];
+
+// Donate/support accent tracks the themed brand token (per-[data-theme]) so the
+// panel recolors with the app theme instead of the old fixed pink.
+const DONATE_HUE = 'var(--color-brand)';
+
+// PayPal.me carries the chosen amount straight into the checkout; Ko-fi opens
+// its tip page (no reliable preset-amount URL). A non-numeric/"custom" amount
+// falls back to the bare link.
+function methodUrl(method, amount) {
+  if (method.id === 'paypal' && typeof amount === 'number') return `${PAYPAL_URL}/${amount}`;
+  return method.url;
+}
+
+// Compact payment button. `hue` tints the icon bubble + hover.
+function LinkCard({ icon, label, hue, onClick }) {
   return (
     <button
       type="button"
-      className="donate-card donate-card--link lp-glow-card"
-      style={style}
-      onClick={() => openExternal(method.url)}
+      onClick={onClick}
+      style={{ '--card-hue': hue }}
+      className="flex min-h-10 w-full items-center gap-2.5 overflow-hidden rounded-md border border-border bg-transparent px-3 py-2 text-left transition-colors hover:border-transparent hover:bg-[color-mix(in_srgb,var(--card-hue)_6%,transparent)]"
     >
-      <span className="donate-card__glow" aria-hidden="true" />
-      <div className="donate-card__icon">{method.icon}</div>
-      <div className="donate-card__body">
-        <div className="donate-card__label">{method.label}</div>
-        <div className="donate-card__desc">{t(method.descriptionKey)}</div>
-      </div>
-      <div className="donate-card__arrow">
-        <ExternalLink size={14} />
-      </div>
+      <span className="flex size-7 shrink-0 items-center justify-center rounded-md border border-transparent bg-[color-mix(in_srgb,var(--card-hue)_10%,transparent)] text-base">
+        {icon}
+      </span>
+      <span className="min-w-0 flex-1 font-mono text-xs font-semibold uppercase tracking-[var(--chrome-label-track)] text-[var(--chrome-fg)]">
+        {label}
+      </span>
+      <span className="flex size-6 shrink-0 items-center justify-center text-[var(--chrome-fg-muted)]">
+        <ExternalLink size={13} />
+      </span>
     </button>
+  );
+}
+
+// Section label: a mono uppercase caption with a trailing hairline.
+function SectionTitle({ children }) {
+  return (
+    <div className="mb-2 flex items-center gap-3">
+      <span className="whitespace-nowrap font-mono text-[var(--chrome-label-size)] font-semibold uppercase tracking-[var(--chrome-label-track)] text-[var(--chrome-fg-muted)]">
+        {children}
+      </span>
+      <span className="h-px flex-1 bg-border" />
+    </div>
+  );
+}
+
+/* ── Sponsors ─────────────────────────────────────────────────────────────
+   Logo grid grouped by tier when SPONSORS has entries; a tasteful "be the
+   first" outlined slot when it's empty. Logos link out via the app's
+   openExternal (Tauri-safe) while keeping a real href for accessibility. */
+
+// A single clickable sponsor logo. Real <a href> (right-click / a11y) but the
+// click is intercepted so it opens in the system browser, not the webview.
+function SponsorLogo({ sponsor }) {
+  const { t } = useTranslation();
+  return (
+    <a
+      href={sponsor.url}
+      target="_blank"
+      rel="noreferrer"
+      onClick={(e) => {
+        e.preventDefault();
+        openExternal(sponsor.url);
+      }}
+      title={sponsor.name}
+      aria-label={t('support.sponsors_logo_aria', {
+        defaultValue: 'Visit {{name}}, a VoiceStudio sponsor',
+        name: sponsor.name,
+      })}
+      className="flex min-h-11 items-center justify-center rounded-md border border-border bg-transparent px-3 py-2 transition-colors hover:border-transparent hover:bg-[var(--chrome-hover-bg)]"
+    >
+      <img
+        src={sponsor.logoUrl}
+        alt={sponsor.name}
+        loading="lazy"
+        className="max-h-8 w-auto max-w-full object-contain"
+      />
+    </a>
+  );
+}
+
+function SponsorsSection() {
+  const { t } = useTranslation();
+
+  // Group by tier in the configured order; anything with an unrecognized (or
+  // missing) tier is collected into a trailing untiered group.
+  const groups = SPONSOR_TIERS.map((tier) => [
+    tier,
+    SPONSORS.filter((s) => s.tier === tier),
+  ]).filter(([, list]) => list.length > 0);
+  const untiered = SPONSORS.filter((s) => !SPONSOR_TIERS.includes(s.tier));
+  if (untiered.length) groups.push(['', untiered]);
+
+  return (
+    <section className="min-w-0">
+      <SectionTitle>{t('support.sponsors_title', { defaultValue: 'Sponsors' })}</SectionTitle>
+
+      {SPONSORS.length === 0 ? (
+        <div
+          data-testid="sponsors-empty"
+          className="flex flex-wrap items-center gap-2.5 rounded-md border border-dashed border-border-strong bg-[color-mix(in_srgb,var(--color-brand)_4%,transparent)] p-3"
+        >
+          <span className="flex size-8 shrink-0 items-center justify-center rounded-md border border-transparent bg-[color-mix(in_srgb,var(--color-brand)_12%,transparent)] text-[var(--color-brand)]">
+            <Gem size={16} />
+          </span>
+          <span className="min-w-[150px] flex-1">
+            <span className="block font-serif text-[0.9rem] leading-tight text-[var(--chrome-fg)]">
+              {t('support.sponsors_empty_title', {
+                defaultValue: 'Be the first to sponsor VoiceStudio',
+              })}
+            </span>
+            <span className="block font-mono text-[0.6rem] uppercase tracking-[var(--chrome-label-track)] text-[var(--chrome-fg-dim)]">
+              {t('support.sponsors_empty_desc', { defaultValue: 'Your logo here' })}
+            </span>
+          </span>
+          <Button
+            variant="primary"
+            size="sm"
+            leading={<Gem size={13} />}
+            onClick={() => openExternal(SPONSOR_CONTACT.githubIssue)}
+            aria-label={t('support.sponsors_become_aria', {
+              defaultValue: 'Become a sponsor — opens a prefilled GitHub issue in your browser',
+            })}
+          >
+            {t('support.sponsors_become', { defaultValue: 'Become a sponsor' })}
+          </Button>
+        </div>
+      ) : (
+        <div className="flex flex-col gap-2.5">
+          {groups.map(([tier, list]) => (
+            <div key={tier || 'untiered'}>
+              {tier && (
+                <div className="mb-1.5 font-mono text-[0.6rem] font-semibold uppercase tracking-[var(--chrome-label-track)] text-[var(--chrome-fg-dim)]">
+                  {t(`support.sponsors_tier_${tier}`, { defaultValue: tier })}
+                </div>
+              )}
+              <div className="grid grid-cols-[repeat(auto-fill,minmax(100px,1fr))] gap-2">
+                {list.map((s) => (
+                  <SponsorLogo key={s.name} sponsor={s} />
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {SPONSORS.length > 0 && (
+        <div className="mt-2.5 flex flex-wrap items-center justify-center gap-2">
+          <Button
+            variant="primary"
+            size="sm"
+            leading={<Gem size={13} />}
+            onClick={() => openExternal(SPONSOR_CONTACT.githubIssue)}
+            aria-label={t('support.sponsors_become_aria', {
+              defaultValue: 'Become a sponsor — opens a prefilled GitHub issue in your browser',
+            })}
+          >
+            {t('support.sponsors_become', { defaultValue: 'Become a sponsor' })}
+          </Button>
+          <button
+            type="button"
+            onClick={() => openExternal(SPONSOR_CONTACT.docsUrl)}
+            className="font-sans text-[0.7rem] font-semibold text-[var(--chrome-accent)] hover:underline"
+          >
+            {t('support.sponsors_learn_more', { defaultValue: 'What sponsors get' })}
+          </button>
+        </div>
+      )}
+    </section>
   );
 }
 
 /* ── Support (donate) panel ───────────────────────────────────────────── */
 function SupportView() {
   const { t } = useTranslation();
+  const [progress, setProgress] = useState(BUNDLED_PROGRESS);
+  const [amount, setAmount] = useState(null); // none pre-selected by design
+
+  useEffect(() => {
+    let alive = true;
+    loadDonationProgress().then((p) => {
+      if (alive) setProgress(p);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
   return (
-    <div className="support-view">
-      <div className="donate-hero">
-        <div className="donate-hero__icon-wrap">
-          <Heart size={24} className="donate-hero__heart" />
-        </div>
-        <h2 className="donate-hero__title">
+    <div className="flex flex-col gap-4">
+      <header className="flex items-center justify-center gap-3 text-center">
+        <span className="flex size-10 shrink-0 items-center justify-center rounded-md border border-transparent bg-[color-mix(in_srgb,var(--color-brand)_12%,transparent)]">
+          <Heart
+            size={20}
+            className="text-[var(--color-brand)] [fill:color-mix(in_srgb,var(--color-brand)_35%,transparent)] drop-shadow-[0_0_12px_color-mix(in_srgb,var(--color-brand)_50%,transparent)]"
+          />
+        </span>
+        <h2 className="relative inline-block font-serif text-[1.7rem] font-normal leading-tight tracking-[-0.02em] text-[var(--chrome-fg)]">
           {t('donate.hero_title')}
           <span className="lp-hero__sweep" aria-hidden="true" />
         </h2>
-        <p className="donate-hero__subtitle">{t('donate.hero_desc')}</p>
+      </header>
+
+      <div className="grid grid-cols-[repeat(auto-fit,minmax(280px,1fr))] gap-4">
+        <div className="flex min-w-0 flex-col gap-3.5">
+          <Card className="gap-0 rounded-md border-border bg-[color-mix(in_srgb,var(--chrome-accent)_4%,transparent)] p-4 shadow-none">
+            <GoalBar progress={progress} />
+          </Card>
+
+          <section>
+            <SectionTitle>
+              {t('donate.suggested_title', { defaultValue: 'Pick an amount' })}
+            </SectionTitle>
+            <div
+              className="grid grid-cols-4 gap-1.5"
+              role="group"
+              aria-label={t('donate.suggested_title', { defaultValue: 'Pick an amount' })}
+            >
+              {SUGGESTED_AMOUNTS.map((a) => {
+                const selected = amount === a.value;
+                return (
+                  <button
+                    key={a.value}
+                    type="button"
+                    aria-pressed={selected}
+                    aria-label={
+                      a.common
+                        ? `${a.label} — ${t('donate.most_common', { defaultValue: 'most common' })}`
+                        : a.label
+                    }
+                    onClick={() => setAmount(selected ? null : a.value)}
+                    className={`flex min-h-10 items-center justify-center rounded-md border px-1.5 py-1.5 transition-colors ${
+                      selected
+                        ? 'border-[var(--chrome-accent)] bg-[var(--chrome-accent-bg)]'
+                        : `${a.common ? 'border-transparent' : 'border-border'} hover:border-transparent hover:bg-[color-mix(in_srgb,var(--chrome-accent)_7%,transparent)]`
+                    }`}
+                  >
+                    <span className="font-serif text-[0.95rem] font-medium text-[var(--chrome-fg)]">
+                      {a.label}
+                    </span>
+                  </button>
+                );
+              })}
+              <button
+                type="button"
+                aria-pressed={amount === 'custom'}
+                onClick={() => setAmount(amount === 'custom' ? null : 'custom')}
+                className={`flex min-h-10 items-center justify-center rounded-md border px-1.5 py-1.5 transition-colors ${
+                  amount === 'custom'
+                    ? 'border-[var(--chrome-accent)] bg-[var(--chrome-accent-bg)]'
+                    : 'border-border hover:border-transparent hover:bg-[color-mix(in_srgb,var(--chrome-accent)_7%,transparent)]'
+                }`}
+              >
+                <span className="font-mono text-[0.7rem] uppercase tracking-[var(--chrome-label-track)] text-[var(--chrome-fg-muted)]">
+                  {t('donate.custom', { defaultValue: 'Custom' })}
+                </span>
+              </button>
+            </div>
+          </section>
+
+          <section>
+            <SectionTitle>
+              {typeof amount === 'number'
+                ? t('donate.choose_method_amount', {
+                    defaultValue: 'Continue with ${{amount}}',
+                    amount,
+                  })
+                : t('donate.choose_method', { defaultValue: 'Choose how to give' })}
+            </SectionTitle>
+            <div className="grid grid-cols-2 gap-2">
+              {METHODS.map((m) => (
+                <LinkCard
+                  key={m.id}
+                  icon={m.icon}
+                  label={m.label}
+                  hue={DONATE_HUE}
+                  onClick={() =>
+                    openExternal(methodUrl(m, typeof amount === 'number' ? amount : null))
+                  }
+                />
+              ))}
+            </div>
+          </section>
+        </div>
+
+        <div className="flex min-w-0 flex-col gap-3.5">
+          <SponsorsSection />
+          <section>
+            <SectionTitle>{t('support.other_ways')}</SectionTitle>
+            <div className="flex flex-wrap gap-2">
+              <Button
+                variant="subtle"
+                size="sm"
+                leading={<Star size={13} />}
+                onClick={() => openExternal('https://github.com/debpalash/VoiceStudio')}
+              >
+                {t('support.star_github')}
+              </Button>
+              <Button
+                variant="subtle"
+                size="sm"
+                leading={<MessageCircle size={13} />}
+                onClick={() => openExternal('https://discord.gg/bzQavDfVV9')}
+              >
+                {t('support.join_discord')}
+              </Button>
+            </div>
+          </section>
+        </div>
       </div>
-
-      <section className="donate-section">
-        <div className="donate-section__title"><span>{t('donate.platforms')}</span></div>
-        <div className="donate-grid support-methods">
-          {METHODS.map((m, i) => (
-            <LinkCard key={m.id} method={m} style={{ '--anim-i': i, '--card-hue': '#d3869b' }} />
-          ))}
-        </div>
-      </section>
-
-      {/* Non-monetary ways to help — gives people who can't (or don't want to)
-          donate a real way to support, and balances out the panel. */}
-      <section className="donate-section">
-        <div className="donate-section__title"><span>{t('support.other_ways')}</span></div>
-        <div className="support-chips">
-          <button
-            type="button"
-            className="support-chip"
-            onClick={() => openExternal('https://github.com/debpalash/OmniVoice-Studio')}
-          >
-            <Star size={14} /> {t('support.star_github')}
-          </button>
-          <button
-            type="button"
-            className="support-chip"
-            onClick={() => openExternal('https://discord.gg/bzQavDfVV9')}
-          >
-            <MessageCircle size={14} /> {t('support.join_discord')}
-          </button>
-        </div>
-      </section>
-
-      <div className="donate-footer">{t('donate.footer')}</div>
     </div>
   );
 }
 
 /* ── Commercial License panel ─────────────────────────────────────────── */
+const LICENSE_EMAIL = 'VoiceStudio@palash.dev';
+const LICENSE_MAILTO =
+  'mailto:VoiceStudio@palash.dev?subject=VoiceStudio Commercial License Inquiry' +
+  '&body=Hi Palash,%0A%0AI%27d like to talk about a commercial license for VoiceStudio.%0A%0AOrganization:%0ATeam size:%0AUse case:%0A';
+
 function LicenseView() {
   const { t } = useTranslation();
   const WHY_ITEMS = [
-    { icon: Shield, label: t('enterprise.benefit_ip'), desc: t('enterprise.benefit_ip_desc') },
-    { icon: Zap, label: t('enterprise.benefit_cost'), desc: t('enterprise.benefit_cost_desc') },
-    { icon: Users, label: t('enterprise.benefit_team'), desc: t('enterprise.benefit_team_desc') },
-    { icon: Headphones, label: t('enterprise.benefit_support'), desc: t('enterprise.benefit_support_desc') },
-    { icon: Code, label: t('enterprise.benefit_source'), desc: t('enterprise.benefit_source_desc') },
-    { icon: Globe, label: t('enterprise.benefit_lang'), desc: t('enterprise.benefit_lang_desc') },
+    { icon: Shield, label: t('enterprise.benefit_ip') },
+    { icon: Zap, label: t('enterprise.benefit_cost') },
+    { icon: Headphones, label: t('enterprise.benefit_support') },
   ];
   return (
-    <div className="support-view">
-      <div className="ent-hero">
-        <span className="ent-hero__kicker">{t('enterprise.badge')}</span>
-        <h2 className="ent-hero__title">
+    <div className="flex flex-col gap-4">
+      <header className="text-center">
+        <Badge tone="neutral" size="sm">
+          {t('enterprise.badge')}
+        </Badge>
+        <h2 className="relative mt-2 inline-block font-serif text-[1.8rem] font-normal leading-tight tracking-[-0.02em] text-[var(--chrome-fg)]">
           {t('enterprise.hero_title')}
           <span className="lp-hero__sweep" aria-hidden="true" />
         </h2>
-        <p className="ent-hero__subtitle">{t('enterprise.hero_desc')}</p>
-        <p className="ent-hero__subtitle">{t('enterprise.hero_note')}</p>
-      </div>
+        <p className="mx-auto mt-3 max-w-[680px] font-sans text-[0.78rem] leading-[1.5] text-[var(--chrome-fg-muted)]">
+          {t('enterprise.hero_simple', {
+            defaultValue:
+              'VoiceStudio is free and open-source under the AGPL-3.0 — including for commercial and internal business use. You only need a commercial license to embed it in a closed-source product without AGPL’s copyleft obligations.',
+          })}
+        </p>
+      </header>
 
-      <section className="ent-why">
-        <div className="ent-section-title"><span>{t('enterprise.why_title')}</span></div>
-        <div className="ent-why__grid">
-          {WHY_ITEMS.map(({ icon: Icon, label, desc }) => (
-            <div key={label} className="ent-why__card">
-              <div className="ent-why__icon"><Icon size={16} /></div>
-              <div className="ent-why__label">{label}</div>
-              <div className="ent-why__desc">{desc}</div>
+      <section className="grid grid-cols-[repeat(auto-fit,minmax(160px,1fr))] gap-2">
+        {WHY_ITEMS.map(({ icon: Icon, label }) => (
+          <Card
+            key={label}
+            className="flex-row items-center gap-2.5 rounded-md border-border bg-transparent p-3 shadow-none transition-colors hover:border-border-strong hover:bg-[var(--chrome-hover-bg)]"
+          >
+            <span className="flex size-8 shrink-0 items-center justify-center rounded-md border border-transparent bg-[color-mix(in_srgb,var(--color-brand)_10%,transparent)] text-[var(--color-brand)]">
+              <Icon size={15} />
+            </span>
+            <div className="font-mono text-[0.68rem] font-semibold uppercase tracking-[var(--chrome-label-track)] text-[var(--chrome-fg)]">
+              {label}
             </div>
-          ))}
-        </div>
+          </Card>
+        ))}
       </section>
 
-      <section className="ent-tiers-section">
-        <div className="ent-section-title"><span>{t('enterprise.pricing_title')}</span></div>
-        <div className="ent-coming-soon">
-          <p>
-            <strong>{t('enterprise.pricing_desc')}</strong>{' '}
-            {t('enterprise.pricing_detail')}
-          </p>
-          <button
-            type="button"
-            className="ent-coming-soon__cta"
-            onClick={() => openExternal('mailto:OmniVoice@palash.dev?subject=OmniVoice Commercial License Inquiry&body=Hi Palash,%0A%0AI%27d like to talk about a commercial license for OmniVoice Studio.%0A%0AOrganization:%0ATeam size:%0AUse case:%0A')}
+      <section>
+        <Card className="flex-row flex-wrap items-center justify-center gap-3 rounded-md border-border bg-[color-mix(in_srgb,#fe8019_5%,transparent)] p-4 text-center shadow-none">
+          <Button
+            variant="subtle"
+            size="sm"
+            leading={<Mail size={13} />}
+            onClick={() => openExternal(LICENSE_MAILTO)}
+            className="border-transparent bg-[color-mix(in_srgb,#fe8019_18%,transparent)] font-semibold text-[var(--chrome-fg)] hover:border-transparent hover:bg-[color-mix(in_srgb,#fe8019_28%,transparent)]"
           >
-            <Mail size={13} />
             {t('enterprise.request_quote')}
-          </button>
-        </div>
-      </section>
-
-      <section className="ent-faq">
-        <div className="ent-section-title"><span>{t('enterprise.faq_title')}</span></div>
-        <div className="ent-faq__list">
-          <details className="ent-faq__item">
-            <summary>{t('enterprise_faq.q_internal_tools')}</summary>
-            <p>{t('enterprise_faq.a_internal_tools')}</p>
-          </details>
-          <details className="ent-faq__item">
-            <summary>{t('enterprise_faq.q_try_before')}</summary>
-            <p>{t('enterprise_faq.a_try_before')}</p>
-          </details>
-          <details className="ent-faq__item">
-            <summary>{t('enterprise_faq.q_watermark')}</summary>
-            <p>{t('enterprise_faq.a_watermark')}</p>
-          </details>
-          <details className="ent-faq__item">
-            <summary>{t('enterprise_faq.q_apache')}</summary>
-            <p>{t('enterprise_faq.a_apache')}</p>
-          </details>
-        </div>
-      </section>
-
-      <div className="ent-cta-footer">
-        <p>
+          </Button>
           <button
             type="button"
-            className="ent-cta-footer__link"
-            onClick={() => openExternal('mailto:OmniVoice@palash.dev')}
-            title="OmniVoice@palash.dev"
+            onClick={() => openExternal(LICENSE_MAILTO)}
+            title={LICENSE_EMAIL}
+            className="font-mono text-[0.65rem] text-[var(--chrome-accent)] hover:underline"
           >
-            {t('enterprise.footer_email')}
+            {LICENSE_EMAIL}
           </button>
-        </p>
-        <p className="ent-cta-footer__sub">
-          <button
-            type="button"
-            className="ent-cta-footer__link"
-            onClick={() => openExternal('https://discord.gg/bzQavDfVV9')}
-            title="discord.gg/bzQavDfVV9"
-          >
-            {t('enterprise.footer_discord')}
-          </button>
-        </p>
-      </div>
+        </Card>
+      </section>
     </div>
   );
 }
 
-/**
- * SupportPage — unifies the donate ("Support") and commercial-license panels
- * behind a single charming segmented toggle. Both legacy modes ('donate',
- * 'enterprise') route here with the matching initialView, so every existing
- * entry point (footer heart, dub/export "commercial license" links) still
- * works — they just land on the right tab.
- */
 export default function SupportPage({ onBack, initialView = 'support' }) {
   const { t } = useTranslation();
-  const [view, setView] = useState(initialView === 'license' ? 'license' : 'support');
+  const [view, setView] = useState(() => viewFromRoute(initialView));
+
+  // App.jsx reuses this component across donate / enterprise / contact and
+  // changes only the prop, so route changes must also move the active tab.
+  useEffect(() => {
+    setView(viewFromRoute(initialView));
+  }, [initialView]);
+
+  const tabItems = [
+    { id: 'support', label: t('support.tab_support'), icon: Heart },
+    { id: 'license', label: t('support.tab_license'), icon: Building2 },
+    { id: 'contact', label: t('logs.contact', { defaultValue: 'Contact' }), icon: MessageCircle },
+  ];
+  const panelLabel = tabItems.find((item) => item.id === view)?.label;
 
   return (
-    <div className="support-page donate-page">
+    <div className="relative isolate flex min-h-0 flex-1 flex-col overflow-hidden bg-[var(--chrome-bg)] [container-type:inline-size] [container-name:support-shell]">
       {/* Aurora backdrop — shared with the Launchpad */}
       <div className="lp-aurora" aria-hidden="true">
         <span className="lp-aurora__blob lp-aurora__blob--pink" />
@@ -213,44 +453,46 @@ export default function SupportPage({ onBack, initialView = 'support' }) {
         <span className="lp-aurora__blob lp-aurora__blob--amber" />
       </div>
 
-      {/* Top bar: Back (left) · toggle (center) · spacer (right, balances Back) */}
-      <div className="support-page__topbar">
+      <div className="relative z-[2] flex shrink-0 items-center justify-between gap-3 px-8 pt-3">
         <Button variant="subtle" size="sm" onClick={onBack} leading={<ArrowLeft size={14} />}>
           {t('donate.back')}
         </Button>
-
-        <div className="support-toggle" role="tablist" aria-label={t('support.toggle_label')}>
-          <span className="support-toggle__pill" data-view={view} aria-hidden="true" />
-          <button
-            type="button"
-            role="tab"
-            aria-selected={view === 'support'}
-            className={`support-toggle__opt ${view === 'support' ? 'is-active' : ''}`}
-            onClick={() => setView('support')}
-          >
-            <Heart size={13} /> {t('support.tab_support')}
-          </button>
-          <button
-            type="button"
-            role="tab"
-            aria-selected={view === 'license'}
-            className={`support-toggle__opt ${view === 'license' ? 'is-active' : ''}`}
-            onClick={() => setView('license')}
-          >
-            <Building2 size={13} /> {t('support.tab_license')}
-          </button>
-        </div>
-
-        <span className="support-page__spacer" aria-hidden="true" />
+        <Tabs
+          items={tabItems}
+          value={view}
+          onChange={setView}
+          size="sm"
+          aria-label={t('support.toggle_label')}
+        />
+        <span className="w-24 shrink-0" aria-hidden="true" />
       </div>
 
-      {/* key={view} remounts the panel so its entry animations replay on toggle.
-          The --support modifier vertically centers the (short) Support panel so
-          it doesn't float at the top of an empty page; License stays top-aligned
-          since it's tall enough to fill on its own. */}
-      <div className={`support-page__content donate-page__content support-page__content--${view}`} key={view}>
-        {view === 'support' ? <SupportView /> : <LicenseView />}
-      </div>
+      <main
+        id={`support-${view === 'license' ? 'license' : view === 'contact' ? 'contact' : 'give'}`}
+        role="tabpanel"
+        aria-label={panelLabel}
+        className="relative z-[1] mx-auto flex min-h-0 w-full max-w-[820px] flex-1 flex-col justify-center overflow-y-auto px-6 py-3"
+        key={view}
+      >
+        {view === 'support' ? (
+          <SupportView />
+        ) : view === 'license' ? (
+          <LicenseView />
+        ) : (
+          <div className="flex flex-col gap-4">
+            <header className="flex items-center justify-center gap-3 text-center">
+              <span className="flex size-10 shrink-0 items-center justify-center rounded-md border border-transparent bg-[color-mix(in_srgb,#d3869b_12%,transparent)]">
+                <MessageCircle size={20} className="text-[#f3a5b6]" />
+              </span>
+              <h2 className="relative inline-block font-serif text-[1.7rem] font-normal leading-tight tracking-[-0.02em] text-[var(--chrome-fg)]">
+                {t('contact.hero_title', { defaultValue: 'We\u2019d love to hear from you' })}
+                <span className="lp-hero__sweep" aria-hidden="true" />
+              </h2>
+            </header>
+            <ContactSections onSupport={() => setView('support')} />
+          </div>
+        )}
+      </main>
     </div>
   );
 }

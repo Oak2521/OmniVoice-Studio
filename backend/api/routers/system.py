@@ -1,6 +1,7 @@
 import os
 import sys
 import platform
+import time
 import uuid
 import psutil
 import asyncio
@@ -10,27 +11,28 @@ from core.prefs import set_ as prefs_set, delete as prefs_delete
 from services import network_share
 from services import tailscale as _tailscale
 from api.schemas import SysinfoResponse, SystemInfoResponse, ModelStatusResponse
-from api.dependencies import require_loopback
+from api.dependencies import is_loopback, require_admin, require_admin_action
 from fastapi.responses import FileResponse, StreamingResponse
 import torch
 import shutil
 
 from core.config import OUTPUTS_DIR, DATA_DIR, CRASH_LOG_PATH, LOG_PATH, IDLE_TIMEOUT_SECONDS
 from core.version import APP_VERSION
-from services.model_manager import get_model_status, get_best_device
+from core.logging_utils import log_safe
+from core.public_errors import public_failure
+from services.model_manager import get_model_status, get_best_device, resolve_omnivoice_checkpoint
 from services.ffmpeg_utils import find_ffmpeg, run_ffmpeg
 
-# Router-level loopback gate. Every route mounted on `router` (GET + POST,
-# present and future) is gated by `require_loopback`, which 403s any request
-# whose `client.host` is not a loopback address. This closes the same trust
+# Router-level admin gate. Every route mounted on `router` (GET + POST,
+# present and future) is gated by `require_admin`: desktop requests must be
+# loopback; server-mode mutations require the long API key. This closes the trust
 # boundary that PR #81 only patched on `/system/set-env` and that the
 # 260518-ivy deferred-items file enumerated for follow-up: /model/unload/*,
 # /system/logs/clear, /system/logs/tauri/clear, /system/flush-memory,
 # /clean-audio (POSTs) plus the read-side info-disclosure routes
 # /system/info, /system/logs, /system/logs/tauri, /system/logs/stream.
-# This router only ever serves the local Tauri shell and the dev frontend
-# at http://127.0.0.1:3901 — both are loopback origins.
-router = APIRouter(dependencies=[Depends(require_loopback)])
+# Native Tauri/dev callers remain loopback and need no credential.
+router = APIRouter(dependencies=[Depends(require_admin)])
 logger = logging.getLogger("omnivoice.api")
 
 # Cache device checks at module load — they don't change at runtime
@@ -38,6 +40,57 @@ _is_mac = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
 _is_cuda = torch.cuda.is_available()
 # Prime psutil's internal CPU counter so the first non-blocking call returns useful data
 psutil.cpu_percent(interval=None)
+
+
+def _detect_cpu_model() -> str:
+    """Human-readable CPU model. platform.processor() is empty on most
+    Linux distros, so read /proc/cpuinfo there; sysctl on macOS."""
+    try:
+        if sys.platform.startswith("linux"):
+            with open("/proc/cpuinfo") as f:
+                for line in f:
+                    if line.lower().startswith("model name"):
+                        return line.split(":", 1)[1].strip()
+        if sys.platform == "darwin":
+            import subprocess
+            return subprocess.check_output(
+                ["sysctl", "-n", "machdep.cpu.brand_string"], text=True, timeout=5
+            ).strip()
+        return platform.processor() or ""
+    except Exception:
+        return platform.processor() or ""
+
+
+def _detect_gpu() -> tuple[str, float]:
+    """(gpu_name, vram_total_gb) — static for the process lifetime.
+
+    MPS has unified memory, so there's no separate VRAM figure to report;
+    the name alone tells a bug-report reader what hardware this is.
+    """
+    try:
+        if _is_cuda:
+            props = torch.cuda.get_device_properties(0)
+            return torch.cuda.get_device_name(0), round(props.total_memory / (1024 ** 3), 1)
+        if _is_mac:
+            return "Apple Silicon (MPS)", 0.0
+    except Exception:
+        pass
+    return "", 0.0
+
+
+# Static hardware facts, captured once — /system/info is hit on every
+# Settings page load and must stay cheap.
+_CPU_MODEL = _detect_cpu_model()
+_GPU_NAME, _VRAM_TOTAL_GB = _detect_gpu()
+_RAM_TOTAL_GB = round(psutil.virtual_memory().total / (1024 ** 3), 1)
+_OS_VERSION = platform.platform()
+
+
+def _disk_free_gb() -> float:
+    try:
+        return round(shutil.disk_usage(DATA_DIR).free / (1024 ** 3), 1)
+    except Exception:
+        return 0.0
 
 
 def _ui_port() -> int:
@@ -53,6 +106,52 @@ def _ui_port() -> int:
         return int(raw)
     except (TypeError, ValueError):
         return 3901
+
+
+def _fast_download_status() -> dict:
+    """Report the download-acceleration state for the Settings UI (FDL-03).
+
+    Reports the *runtime* truth, not just whether hf_xet is importable. The app
+    currently sets ``HF_HUB_DISABLE_XET=1`` by default (main.py) — Xet's chunked
+    transfer is fast but its progress bypasses our tqdm patch, so the legacy-LFS
+    path is forced to keep accurate byte progress. So:
+
+      * ``xet_installed`` — hf_xet present
+      * ``xet_active``    — installed AND not disabled via HF_HUB_DISABLE_XET
+      * ``xet_enabled``   — alias of xet_active (what the UI badge keys off)
+
+    Must never throw: /system/info is called on every Settings load.
+    """
+    installed = False
+    version = None
+    try:
+        import hf_xet  # noqa: F401
+        installed = True
+        try:
+            from importlib.metadata import version as _ver
+            version = _ver("hf-xet")
+        except Exception:
+            version = None
+    except Exception:
+        installed = False
+    disabled = str(os.environ.get("HF_HUB_DISABLE_XET", "")).strip().lower() in {"1", "true", "yes", "on"}
+    active = installed and not disabled
+    try:
+        from core import prefs
+        high_perf = prefs.resolve(
+            "xet_high_performance", env="HF_XET_HIGH_PERFORMANCE", default=False
+        )
+        high_perf = high_perf if isinstance(high_perf, bool) else \
+            str(high_perf).strip().lower() in {"1", "true", "yes", "on"}
+    except Exception:
+        high_perf = False
+    return {
+        "xet_installed": installed,
+        "xet_active": active,
+        "xet_enabled": active,  # UI badge: only true when Xet actually runs
+        "xet_version": version,
+        "high_performance": bool(high_perf),
+    }
 
 
 def _has_hf_token() -> bool:
@@ -76,88 +175,23 @@ def model_status():
 
 @router.get("/model/loaded")
 def loaded_models():
-    """Return details about all currently loaded models for the flush dropdown.
-
-    Returns a list of models with name, type, device, and estimated VRAM usage.
-    """
-    import services.model_manager as mm
-
-    models = []
-
-    # 1. TTS model (OmniVoice)
-    if mm.model is not None:
-        device = "unknown"
-        vram_mb = 0
-        try:
-            device = str(next(mm.model.parameters()).device) if hasattr(mm.model, 'parameters') else get_best_device()
-        except Exception:
-            device = get_best_device()
-        try:
-            torch = mm._lazy_torch()
-            if torch.cuda.is_available():
-                vram_mb = torch.cuda.memory_allocated() / (1024 ** 2)
-            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                driver = getattr(torch.mps, "driver_allocated_memory", None)
-                if driver:
-                    vram_mb = driver() / (1024 ** 2)
-        except Exception:
-            pass
-        models.append({
-            "id": "tts",
-            "name": "OmniVoice TTS",
-            "checkpoint": os.environ.get("OMNIVOICE_MODEL", "k2-fsa/OmniVoice"),
-            "device": device,
-            "vram_mb": round(vram_mb, 1),
-            "unloadable": True,
-        })
-
-    # 2. ASR model (WhisperX)
-    if mm.model is not None and hasattr(mm.model, '_asr_pipe') and mm.model._asr_pipe is not None:
-        models.append({
-            "id": "asr",
-            "name": "WhisperX ASR",
-            "checkpoint": os.environ.get("ASR_MODEL", "Systran/faster-whisper-large-v3"),
-            "device": "cpu",
-            "vram_mb": 0,
-            "unloadable": False,  # tied to TTS model lifecycle
-        })
-
-    # 3. Diarization pipeline
-    if mm._diar_pipeline is not None:
-        models.append({
-            "id": "diarization",
-            "name": "Pyannote Diarization",
-            "checkpoint": "pyannote/speaker-diarization-3.1",
-            "device": get_best_device(),
-            "vram_mb": 0,
-            "unloadable": True,
-        })
-
-    return {"models": models, "count": len(models)}
+    """List all currently loaded models for the flush dropdown (MM2-04).
+    Thin delegation to the model_lifecycle facade — shape unchanged:
+    ``{models, count}``."""
+    from services import model_lifecycle
+    return model_lifecycle.list_loaded()
 
 
 @router.post("/model/unload/{model_id}")
 async def unload_model(model_id: str):
-    """Unload a specific model by ID."""
-    import services.model_manager as mm
-
-    if model_id == "tts":
-        async with mm._model_lock:
-            if mm.model is not None:
-                mm.model = None
-                mm.free_vram()
-                return {"unloaded": "tts", "success": True}
-        return {"unloaded": "tts", "success": False, "reason": "not loaded"}
-
-    elif model_id == "diarization":
-        if mm._diar_pipeline is not None:
-            mm._diar_pipeline = None
-            mm.free_vram()
-            return {"unloaded": "diarization", "success": True}
-        return {"unloaded": "diarization", "success": False, "reason": "not loaded"}
-
-    else:
-        raise HTTPException(status_code=400, detail=f"Unknown model id: {model_id}")
+    """Unload a specific model by id (MM2-04). Delegates to model_lifecycle;
+    an unknown id maps to HTTP 400. ``tts`` | ``diarization`` |
+    ``sidecar:<id>`` | ``sidecars``."""
+    from services import model_lifecycle
+    try:
+        return await model_lifecycle.unload(model_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/system/info", response_model=SystemInfoResponse)
@@ -169,20 +203,42 @@ def system_info():
     """
     try:
         _ffmpeg = find_ffmpeg()
+        from services import model_manager as _mm
+        from core import prefs as _prefs_mod
         return {
             "app_version": APP_VERSION,
+            "generate_timeout_s": _mm.GPU_JOB_TIMEOUT_S,
+            "cpu_generate_timeout_s": _mm.CPU_JOB_TIMEOUT_S,
+            # #1787 review fix: a saved prefs.json value for either key can be
+            # silently shadowed by an external env var (os.environ.setdefault
+            # in core.prefs.restore_env is a no-op when one is already
+            # present) — the Settings panel must say so rather than promise a
+            # restart will apply a value that never will.
+            "generate_timeout_shadowed": _prefs_mod.is_env_shadowed(
+                "OMNIVOICE_GENERATE_TIMEOUT_S"),
+            "cpu_generate_timeout_shadowed": _prefs_mod.is_env_shadowed(
+                "OMNIVOICE_CPU_GENERATE_TIMEOUT_S"),
+            "code_fingerprint": os.environ.get("OMNIVOICE_BUILD_FINGERPRINT", ""),
             "data_dir": DATA_DIR,
             "outputs_dir": OUTPUTS_DIR,
             "crash_log_path": CRASH_LOG_PATH,
             "idle_timeout_seconds": IDLE_TIMEOUT_SECONDS,
-            "model_checkpoint": os.environ.get("OMNIVOICE_MODEL", "k2-fsa/OmniVoice"),
+            "model_checkpoint": resolve_omnivoice_checkpoint(),  # #693: show the effective checkpoint, not a leaked raw value
             "asr_model": os.environ.get("ASR_MODEL", "Systran/faster-whisper-large-v3"),
             "translate_provider": os.environ.get("TRANSLATE_PROVIDER", "google"),
             "has_hf_token": _has_hf_token(),
+            "fast_download": _fast_download_status(),
             "device": get_best_device(),
             "python": sys.version.split()[0],
             "platform": sys.platform,
             "arch": platform.machine(),
+            "os_version": _OS_VERSION,
+            "cpu_model": _CPU_MODEL,
+            "cpu_count": psutil.cpu_count(logical=True) or 0,
+            "ram_total_gb": _RAM_TOTAL_GB,
+            "gpu_name": _GPU_NAME,
+            "vram_total_gb": _VRAM_TOTAL_GB,
+            "disk_free_gb": _disk_free_gb(),
             "ffmpeg_ok": bool(_ffmpeg),
             "ffmpeg_path": _ffmpeg or "",
             "proxy_url": os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy") or "",
@@ -198,6 +254,11 @@ def system_info():
         logger.exception("system_info failed — returning safe defaults")
         return {
             "app_version": APP_VERSION,
+            "generate_timeout_s": 300.0,
+            "cpu_generate_timeout_s": 600.0,
+            "generate_timeout_shadowed": False,
+            "cpu_generate_timeout_shadowed": False,
+            "code_fingerprint": os.environ.get("OMNIVOICE_BUILD_FINGERPRINT", ""),
             "data_dir": DATA_DIR,
             "outputs_dir": OUTPUTS_DIR,
             "crash_log_path": str(CRASH_LOG_PATH),
@@ -210,6 +271,13 @@ def system_info():
             "python": sys.version.split()[0],
             "platform": sys.platform,
             "arch": platform.machine(),
+            "os_version": _OS_VERSION,
+            "cpu_model": _CPU_MODEL,
+            "cpu_count": psutil.cpu_count(logical=True) or 0,
+            "ram_total_gb": _RAM_TOTAL_GB,
+            "gpu_name": _GPU_NAME,
+            "vram_total_gb": _VRAM_TOTAL_GB,
+            "disk_free_gb": _disk_free_gb(),
             "proxy_url": "",
             "share_enabled": network_share.get_state().enabled,
             "share_port": network_share.get_state().share_port,
@@ -218,7 +286,7 @@ def system_info():
             "backend_port": network_share.backend_port(),
             "share_port_base": network_share.share_port_base(),
             "ui_port": _ui_port(),
-            "error": str(e),
+            "error": "System information is temporarily unavailable; check the backend log for details.",
         }
 
 
@@ -229,35 +297,162 @@ def _tail_file(path: str, tail: int):
     return all_lines[-tail:], len(all_lines)
 
 
-def _tauri_log_candidates():
-    """Likely paths for Tauri-side logs, most useful first.
+# Must track main.py's _WindowsSafeRotatingFileHandler(backupCount=3). The
+# handler rolls omnivoice.log at 2 MB into .1/.2/.3, so up to 6 MB of history
+# lives in files this module used to ignore entirely.
+_LOG_BACKUP_COUNT = 3
 
-    `tauri-plugin-log` writes to `~/Library/Logs/<bundle_id>/<file_name>.log`
-    by default on macOS. Our bundle id is `com.debpalash.omnivoice-studio`
-    (see frontend/src-tauri/tauri.conf.json). lib.rs also redirects the
-    spawned backend's stdout/stderr to `~/Library/Logs/OmniVoice/backend.log`
-    which is where `print()` calls and uvicorn startup banners land.
+
+def _rotated_log_paths(base: str) -> list[str]:
+    """Existing `<base>.1 … .N`, newest first."""
+    return [p for p in (f"{base}.{i}" for i in range(1, _LOG_BACKUP_COUNT + 1)) if os.path.exists(p)]
+
+
+def _tail_rolling(base: str, tail: int):
+    """Tail `base`, reaching into its rotated siblings when it runs short.
+
+    A rollover leaves omnivoice.log nearly empty, and the Backend tab then
+    showed a handful of lines — or none — while the failure the user was asked
+    to copy sat in omnivoice.log.1. Reading the current file first keeps the
+    common case at one file read; the backups are only touched when they are
+    the only place the requested lines can come from.
+
+    Returns (lines oldest-first, total lines across the files read, paths read
+    oldest-first). The total counts only the files it had to open — it stops as
+    soon as `tail` is satisfied, so it is "how much is behind these lines",
+    not the size of the whole rotation set.
+    """
+    chunks: list[list[str]] = []
+    paths: list[str] = []
+    total = 0
+    remaining = tail
+    candidates = [p for p in [base, *_rotated_log_paths(base)] if os.path.exists(p)]
+    for path in candidates:
+        if remaining <= 0:
+            break
+        try:
+            lines, count = _tail_file(path, remaining)
+        except FileNotFoundError:
+            # A rollover can rename a candidate between the existence check
+            # above and this open, and the handler holds no lock we can take
+            # from a route. Skip the vanished file rather than 500 the whole
+            # panel over one member of the set — the previous single-file
+            # version failed the request outright in the same situation.
+            #
+            # A roll landing mid-walk can also shift which chunk a file holds,
+            # so a tail taken at that instant may repeat or miss a block. The
+            # panel re-polls every 5s and the next read is clean; buying strict
+            # consistency here would mean reaching into logging's internals.
+            continue
+        except PermissionError as exc:
+            # Windows only, and only the sharing violation: the handler still
+            # holds the file it is rolling. Any other permission failure is a
+            # real misconfiguration and must not be hidden.
+            if os.name == "nt" and getattr(exc, "winerror", None) == 32:
+                continue
+            raise
+        if count == 0:
+            continue
+        chunks.append(lines)
+        paths.append(path)
+        total += count
+        remaining -= len(lines)
+    # Files were visited newest-first; the reader wants oldest-first.
+    out: list[str] = []
+    for chunk in reversed(chunks):
+        out.extend(chunk)
+    return out, total, list(reversed(paths))
+
+def _tauri_plugin_log_candidates():
+    """The `tauri-plugin-log` files — the shell's own log, and the only thing
+    the Tauri tab actually displays.
+
+    Split out from :func:`_tauri_log_candidates` so Clear can touch these and
+    leave the backend stdout/stderr redirect alone. See
+    :func:`clear_tauri_logs`.
     """
     home = os.path.expanduser("~")
     bid = "com.debpalash.omnivoice-studio"
     if sys.platform == "darwin":
         return [
             os.path.join(home, "Library/Logs", bid, "tauri.log"),
-            os.path.join(home, "Library/Logs", bid, "OmniVoice Studio.log"),
-            os.path.join(home, "Library/Logs/OmniVoice/backend.log"),
-            os.path.join(home, "Library/Logs/OmniVoice/backend_err.log"),
+            os.path.join(home, "Library/Logs", bid, "VoiceStudio.log"),
         ]
     if sys.platform.startswith("linux"):
+        data_dir = os.environ.get("XDG_DATA_HOME") or os.path.join(home, ".local/share")
         return [
-            os.path.join(home, ".local/share", bid, "logs", "tauri.log"),
+            os.path.join(data_dir, bid, "logs", "tauri.log"),
             os.path.join(home, ".config", bid, "logs", "tauri.log"),
         ]
     if sys.platform.startswith("win"):
         appdata = os.environ.get("APPDATA", home)
+        localappdata = os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
         return [
+            os.path.join(localappdata, bid, "logs", "tauri.log"),
             os.path.join(appdata, bid, "logs", "tauri.log"),
         ]
     return []
+
+
+def _backend_redirect_log_candidates():
+    """`backend.log` / `backend_err.log` — the spawned backend's stdout and
+    stderr, written by `src-tauri/src/backend.rs::backend_log_path()`.
+
+    Deliberately NOT cleared by the Tauri tab's Clear button.
+    `open_err_log_for_run()` opens `backend_err.log` **append-only** so "a
+    respawn must not destroy the previous run's evidence" (#1510), rotates it
+    to `.1` rather than truncating, and its spawn diagnostics are described
+    there as "retained in backend_err.log across runs and lands verbatim in bug
+    reports". A native death (a Windows access violation, a SIGSEGV) writes
+    nothing to the Python log by construction, so this file is the only record
+    of it.
+
+    `OMNIVOICE_LOG_DIR` is honoured first, in the same precedence
+    `backend_log_path()` uses. The backend is a child of the shell, so an
+    ambient override reaches both — and a resolver that ignored it would look
+    in the per-OS default while the writer wrote somewhere else, which is the
+    divergence class this file already has one of (see #1782).
+    """
+    override = (os.environ.get("OMNIVOICE_LOG_DIR") or "").strip()
+    if override:
+        return [
+            os.path.join(override, "backend.log"),
+            os.path.join(override, "backend_err.log"),
+        ]
+    home = os.path.expanduser("~")
+    if sys.platform == "darwin":
+        base = os.path.join(home, "Library/Logs/OmniVoice")
+    elif sys.platform.startswith("linux"):
+        state_dir = os.environ.get("XDG_STATE_HOME") or os.path.join(home, ".local/state")
+        base = os.path.join(state_dir, "OmniVoice")
+    elif sys.platform.startswith("win"):
+        localappdata = os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+        base = os.path.join(localappdata, "OmniVoice", "Logs")
+    else:
+        return []
+    return [os.path.join(base, "backend.log"), os.path.join(base, "backend_err.log")]
+
+
+def _tauri_log_candidates():
+    """Likely paths for Tauri-side logs, most useful first.
+
+    Two distinct producers, both per-platform:
+
+    - `tauri-plugin-log` writes `tauri.log` to the app log dir
+      (`~/Library/Logs/<bundle_id>` on macOS, `$XDG_DATA_HOME/<bundle_id>/logs`
+      on Linux, `%LOCALAPPDATA%\\<bundle_id>\\logs` on Windows). Bundle id is
+      `com.debpalash.omnivoice-studio` (frontend/src-tauri/tauri.conf.json).
+    - backend.rs::backend_log_path() redirects the spawned backend's
+      stdout/stderr to `backend.log` / `backend_err.log` under
+      `~/Library/Logs/OmniVoice` (macOS), `$XDG_STATE_HOME/OmniVoice` falling
+      back to `~/.local/state/OmniVoice` (Linux), and
+      `%LOCALAPPDATA%\\OmniVoice\\Logs` (Windows). This is where uvicorn
+      startup banners and hard-crash tracebacks land — keep all three OS
+      shapes listed or sidecar crashes become invisible off-macOS.
+    """
+    # Composed from the two halves so the read path keeps seeing every file
+    # while Clear can be narrowed to the shell's own log.
+    return _tauri_plugin_log_candidates() + _backend_redirect_log_candidates()
 
 
 @router.get("/system/logs")
@@ -272,12 +467,24 @@ async def system_logs(tail: int = 200):
     except Exception:
         tail = 200
 
-    path = LOG_PATH if os.path.exists(LOG_PATH) else CRASH_LOG_PATH
-    if not os.path.exists(path):
+    if os.path.exists(LOG_PATH) or _rotated_log_paths(LOG_PATH):
+        base = LOG_PATH
+    else:
+        base = CRASH_LOG_PATH
+    if not os.path.exists(base) and not _rotated_log_paths(base):
         return {"lines": [], "path": LOG_PATH, "exists": False}
+    path = base
     try:
-        lines, total = await asyncio.to_thread(_tail_file, path, tail)
-        return {"lines": lines, "path": path, "exists": True, "total_lines": total}
+        lines, total, paths = await asyncio.to_thread(_tail_rolling, base, tail)
+        return {
+            "lines": lines,
+            "path": path,
+            "exists": True,
+            "total_lines": total,
+            # Which files the tail actually came from, oldest first. A bug
+            # report can then say whether it crossed a rollover.
+            "paths": paths,
+        }
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -299,7 +506,14 @@ async def system_logs_tauri(tail: int = 200):
                 lines, total = await asyncio.to_thread(_tail_file, p, tail)
                 return {"lines": lines, "path": p, "exists": True, "total_lines": total}
             except Exception as e:
-                return {"lines": [], "path": p, "exists": True, "error": str(e)}
+                error = public_failure(
+                    logger,
+                    "Could not read Tauri log",
+                    e,
+                    response="Could not read the Tauri log; check the backend log for details.",
+                    traceback=True,
+                )
+                return {"lines": [], "path": p, "exists": True, "error": error}
     return {"lines": [], "path": None, "exists": False, "candidates": candidates}
 
 
@@ -328,13 +542,18 @@ async def stream_logs(
     if not path or not os.path.exists(path):
         raise HTTPException(status_code=404, detail=f"Log file not found for source={source}")
 
+    try:
+        initial_position = os.path.getsize(path)
+    except OSError as exc:
+        logger.warning("Log stream could not determine its starting position")
+        raise HTTPException(
+            status_code=503,
+            detail="The log stream could not be started. Retry after checking file permissions.",
+        ) from exc
+
     async def _generate():
         """Yield SSE events whenever new lines appear in the log file."""
-        last_pos = 0
-        try:
-            last_pos = os.path.getsize(path)
-        except Exception:
-            pass
+        last_pos = initial_position
         while True:
             await asyncio.sleep(interval)
             try:
@@ -371,9 +590,23 @@ def _read_from_pos(path: str, pos: int) -> list[str]:
 
 @router.post("/system/logs/clear")
 async def clear_system_logs():
-    """Truncate the rolling runtime log and the crash log (what the Backend tab reads)."""
+    """Truncate the rolling runtime log and the crash log (what the Backend tab reads).
+
+    Includes the rotated siblings. Truncating only omnivoice.log left up to
+    6 MB in .1/.2/.3, so Clear freed almost nothing and — now that the tail
+    reaches into those files — would have looked like it did nothing at all.
+    """
     cleared_any = False
-    for p in (LOG_PATH, CRASH_LOG_PATH):
+    # The full fixed name set rather than a snapshot of what exists: enumerating
+    # first leaves a window where a rollover creates a backup after the scan and
+    # its history survives a Clear that reported success. Names the handler can
+    # ever write are known up front, so there is nothing to enumerate.
+    targets = [
+        LOG_PATH,
+        *(f"{LOG_PATH}.{i}" for i in range(1, _LOG_BACKUP_COUNT + 1)),
+        CRASH_LOG_PATH,
+    ]
+    for p in targets:
         if os.path.exists(p):
             try:
                 await asyncio.to_thread(_truncate_file, p)
@@ -383,6 +616,18 @@ async def clear_system_logs():
                     status_code=500,
                     detail=f"Could not clear log at {p}: {e}. The file may be open in another process or read-only — close tailing tools and retry.",
                 )
+    if cleared_any:
+        # The crash log just shrank to zero — drop any stored ack so a stale
+        # byte count can't suppress the next 'crash-last-session' notice.
+        for key in ("crash_log_acked", "crash_log_acked_size"):
+            try:
+                prefs_delete(key)
+            except Exception as exc:
+                logger.warning("Cleared logs but could not reset crash acknowledgement state")
+                raise HTTPException(
+                    status_code=500,
+                    detail="Logs were cleared, but notification state could not be reset. Retry the clear operation.",
+                ) from exc
     return {"cleared": cleared_any}
 
 
@@ -394,16 +639,32 @@ def _truncate_file(path: str):
 
 @router.post("/system/logs/tauri/clear")
 async def clear_tauri_logs():
-    """Truncate whichever Tauri-side log files we know about. OS-level rotation may recreate them."""
+    """Truncate the shell's own log files. OS-level rotation may recreate them.
+
+    The backend stdout/stderr redirect is deliberately excluded. This button
+    lives on a tab that shows `tauri.log`, and truncating `backend_err.log`
+    from it destroyed evidence the user was never shown — the one record of a
+    native death, which writes nothing to the Python log. `backend.rs`'s
+    `open_err_log_for_run()` opens that file append-only precisely so "a
+    respawn must not destroy the previous run's evidence" (#1510) and rotates
+    it to `.1` instead of truncating, so it manages its own size and does not
+    need clearing from here.
+    """
     cleared = []
-    for p in _tauri_log_candidates():
+    failed = 0
+    for p in _tauri_plugin_log_candidates():
         if os.path.exists(p):
             try:
                 await asyncio.to_thread(_truncate_file, p)
                 cleared.append(p)
-            except Exception:
-                pass
-    return {"cleared": cleared}
+            except OSError:
+                failed += 1
+    if failed:
+        raise HTTPException(
+            status_code=500,
+            detail="One or more desktop log files could not be cleared. Close any app using them and retry.",
+        )
+    return {"cleared": cleared, "failed": 0}
 
 @router.get("/sysinfo", response_model=SysinfoResponse)
 def get_sys_info():
@@ -449,9 +710,10 @@ async def flush_memory(unload_model: bool = False):
     if unload_model:
         import services.model_manager as mm
         async with mm._model_lock:
-            if mm.model is not None:
-                mm.model = None
-                freed_model = True
+            # Also drops the clone-prompt side cache, which this path used to
+            # leave resident — an "unload" that kept the encoded reference
+            # tensors belonging to the model it just released (#1495).
+            freed_model = mm.unload_shared_model()
 
     # Multi-pass GC to break reference cycles
     gc.collect(generation=2)
@@ -460,15 +722,25 @@ async def flush_memory(unload_model: bool = False):
 
     free_vram()
 
-    # Snapshot after flush
+    # Snapshot after flush. Two numbers, because one of them is a lie by
+    # omission: `memory_allocated` counts live tensors only, so it reads ~0
+    # after an unload while nvidia-smi still shows gigabytes — which is exactly
+    # the report we keep getting ("flush says it worked, the GPU says it
+    # didn't"). `memory_reserved` is what the caching allocator holds from the
+    # driver, and the gap between reserved and the driver's own figure is the
+    # CUDA context plus kernel workspaces, which no in-process call can return.
     vram_after = 0.0
+    vram_reserved = 0.0
     try:
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             driver = getattr(torch.mps, "driver_allocated_memory", None)
             if driver:
                 vram_after = driver() / (1024**3)
+            current = getattr(torch.mps, "current_allocated_memory", None)
+            vram_reserved = (current() / (1024**3)) if current else vram_after
         elif torch.cuda.is_available():
             vram_after = torch.cuda.memory_allocated() / (1024**3)
+            vram_reserved = torch.cuda.memory_reserved() / (1024**3)
     except Exception:
         pass
 
@@ -479,10 +751,26 @@ async def flush_memory(unload_model: bool = False):
         "unloaded_model": freed_model,
         "ram_after": round(ram_after, 2),
         "vram_after": round(vram_after, 2),
+        "vram_reserved": round(vram_reserved, 2),
     }
 
 
 # ── Actionable notifications ──────────────────────────────────────────────
+
+_GPU_ARCH_WARNING: "list[str | None]" = []  # [-1] = computed result
+
+
+def _gpu_arch_warning_cached() -> "str | None":
+    """check_device_compatibility() once per process (it lazy-imports torch —
+    too heavy for the 30s notifications poll)."""
+    if not _GPU_ARCH_WARNING:
+        try:
+            from services.model_manager import check_device_compatibility
+            compatible, warning = check_device_compatibility()
+            _GPU_ARCH_WARNING.append(None if compatible else warning)
+        except Exception:
+            _GPU_ARCH_WARNING.append(None)
+    return _GPU_ARCH_WARNING[-1]
 
 
 @router.get("/system/notifications")
@@ -515,6 +803,20 @@ def system_notifications():
             },
         })
 
+    # 1b. GPU compute capability unsupported by this torch build (#284) —
+    # the model "runs" but emits pure noise, the worst silent failure mode
+    # (RTX 50-series Blackwell sm_120 on pre-cu128 wheels). The loader logs
+    # this, but a log line never reached the affected users — surface it in
+    # the panel. Checked once per process: it lazy-imports torch.
+    gpu_warn = _gpu_arch_warning_cached()
+    if gpu_warn:
+        notes.append({
+            "id": "gpu-arch-unsupported",
+            "level": "error",
+            "title": "GPU not supported by this PyTorch build",
+            "message": gpu_warn + " Until then, output will be noise/garbage.",
+        })
+
     # 2. Missing ffmpeg
     ffmpeg_ok = False
     try:
@@ -528,15 +830,17 @@ def system_notifications():
         notes.append({
             "id": "ffmpeg-missing",
             "level": "error",
-            "title": "ffmpeg not found",
+            "title": "Media engine unavailable",
             "message": (
-                "Video processing, audio conversion, and dubbing require ffmpeg. "
-                "Install it with: brew install ffmpeg (macOS) or apt install ffmpeg (Linux)."
+                "Video processing, audio conversion, and dubbing need the "
+                "media engine (ffmpeg), which the app normally provisions "
+                "itself. Open Settings > Audio tools and press Restore "
+                "bundled to re-download it, or point it at a system copy."
             ),
             "action": {
-                "label": "Install guide",
-                "type": "link",
-                "target": "https://ffmpeg.org/download.html",
+                "label": "Open Audio tools",
+                "type": "settings-tab",
+                "target": "audio-tools",
             },
         })
 
@@ -549,7 +853,7 @@ def system_notifications():
                 "id": "disk-low",
                 "level": "warn",
                 "title": f"Low disk space ({free_gb:.1f} GB free)",
-                "message": "OmniVoice needs disk space for models, audio, and temp files.",
+                "message": "VoiceStudio needs disk space for models, audio, and temp files.",
                 "action": None,
             })
     except Exception:
@@ -569,7 +873,132 @@ def system_notifications():
             "action": None,
         })
 
+    # 5a. The previous backend RUN died without a clean shutdown (#1164) —
+    #     the run-sentinel record is the browser/dev/Docker equivalent of the
+    #     desktop shell's crash marker. The id embeds detected_at so a NEW
+    #     unclean death re-notifies even after an older one was dismissed.
+    #     Coexists with the crash-last-session note below (that one covers
+    #     caught unhandled exceptions; this one covers process death).
+    try:
+        from core import run_sentinel
+
+        rec = run_sentinel.newest_record()
+        if rec is not None and not rec[1]:
+            record = rec[0]
+            last = record.get("last_activity") or {}
+            doing = f" Last activity: {last.get('kind')}." if last.get("kind") else ""
+            notes.append({
+                # ms resolution: two deaths in the same second must still get
+                # distinct ids, or the second one stays invisible post-ack.
+                "id": f"last-run-crash-{int((record.get('detected_at') or 0) * 1000)}",
+                "level": "error",
+                "title": "The backend did not shut down cleanly last run",
+                "message": (
+                    "The previous backend process ended without a clean "
+                    "shutdown — it likely crashed or was killed (for example "
+                    "by the OS running out of memory)." + doing +
+                    " A log tail was captured for bug reports."
+                ),
+                "action": {
+                    "label": "View logs",
+                    "type": "navigate",
+                    "target": "settings",
+                },
+            })
+    except Exception:
+        logger.warning("Previous-run crash record could not be checked")
+
+    # 5. A previous session logged a crash the user never saw.
+    #    crash_log grew past the last acknowledged size AND predates this
+    #    process — i.e. it happened last run, not just now (errors from the
+    #    current session already surfaced as toasts).
+    try:
+        if _crashed_last_session():
+            notes.append({
+                "id": "crash-last-session",
+                "level": "error",
+                "title": "Last session ended with an error",
+                "message": (
+                    "A crash was logged before this session started. "
+                    "Review the backend log and consider filing a report."
+                ),
+                "action": {
+                    "label": "View logs",
+                    "type": "navigate",
+                    "target": "settings",
+                },
+            })
+    except Exception:
+        logger.warning("Previous-session crash log could not be checked")
+
     return {"notifications": notes, "count": len(notes)}
+
+
+# Process start time — anchors "did the crash happen before this run?".
+_PROCESS_START_TS = time.time()
+
+
+def _crashed_last_session() -> bool:
+    from core.prefs import get as prefs_get
+
+    if not os.path.exists(CRASH_LOG_PATH):
+        return False
+    size = os.path.getsize(CRASH_LOG_PATH)
+    if size == 0:
+        return False
+    mtime = os.path.getmtime(CRASH_LOG_PATH)
+    # Composite ack (size + mtime): a bare byte count goes stale after the log
+    # is truncated — the next crash log can stay smaller than the old acked
+    # size forever, silently suppressing 'crash-last-session'. The ack only
+    # holds while it still covers the file's current state.
+    ack = prefs_get("crash_log_acked")
+    if isinstance(ack, dict):
+        if float(ack.get("mtime", 0) or 0) >= mtime and int(ack.get("size", 0) or 0) >= size:
+            return False
+    else:
+        # Legacy size-only ack from older builds.
+        if size <= int(prefs_get("crash_log_acked_size", 0) or 0):
+            return False
+    return mtime < _PROCESS_START_TS
+
+
+@router.get("/system/last-run-crash")
+async def get_last_run_crash():
+    """Newest unclean-shutdown record from the previous backend run (#1164)
+    — the deployment-agnostic twin of the desktop shell's crash marker
+    (`get_last_backend_crash`), for browser/dev/Docker frontends that have no
+    shell to ask. Version-gated like the shell's markers: records from a
+    different release than the running build are ignored (kept on disk)."""
+    from core import run_sentinel
+
+    rec = run_sentinel.newest_record()
+    if rec is None:
+        return {"record": None, "acknowledged": True}
+    record, acked = rec
+    return {"record": record, "acknowledged": acked}
+
+
+@router.post("/system/last-run-crash/ack")
+async def ack_last_run_crash():
+    """Mark the newest unclean-shutdown record as seen. Watermark semantics
+    (like the shell's ack): the record itself is retained so bug reports can
+    still attach the evidence; a NEWER death re-arms the notice."""
+    from core import run_sentinel
+
+    run_sentinel.acknowledge()
+    return {"ok": True}
+
+
+@router.post("/system/crash/ack")
+async def ack_crash():
+    """Mark the current crash log as seen — dismisses the
+    'crash-last-session' notification until the log changes again."""
+    size = mtime = 0
+    if os.path.exists(CRASH_LOG_PATH):
+        size = os.path.getsize(CRASH_LOG_PATH)
+        mtime = os.path.getmtime(CRASH_LOG_PATH)
+    prefs_set("crash_log_acked", {"size": size, "mtime": mtime})
+    return {"acked_size": size}
 
 
 # ── Environment variable setter ───────────────────────────────────────────
@@ -578,7 +1007,6 @@ def system_notifications():
 PERSISTENT_KEYS = {
     "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
     "http_proxy", "https_proxy", "all_proxy",
-    "FFMPEG_PATH", "FFPROBE_PATH",
     "TRANSLATE_BASE_URL", "TRANSLATE_API_KEY", "TRANSLATE_MODEL",
     "DEEPL_API_KEY", "DEEPL_BASE_URL",
     "MICROSOFT_API_KEY", "MICROSOFT_BASE_URL",
@@ -586,11 +1014,40 @@ PERSISTENT_KEYS = {
     # the Rust sidecar reads OMNIVOICE_PORT at startup and the backend derives
     # the LAN-share/UI ports from the others.
     "OMNIVOICE_PORT", "OMNIVOICE_SHARE_PORT", "OMNIVOICE_UI_PORT",
+    # Per-job compute-time budgets (#1787). Both are captured at import time
+    # by services/model_manager.py (GPU_JOB_TIMEOUT_S / CPU_JOB_TIMEOUT_S), so
+    # a value saved here takes effect on the NEXT backend restart — same
+    # contract as OMNIVOICE_PORT above. Restored into os.environ during the
+    # "env_prefs" startup step (main.py), which runs before model_manager is
+    # first imported ("ml_imports"), so the restored value is what the module
+    # captures. The Settings UI must say so (RestartBadge).
+    "OMNIVOICE_GENERATE_TIMEOUT_S", "OMNIVOICE_CPU_GENERATE_TIMEOUT_S",
 }
+
+# Sidecar-engine install dirs (OMNIVOICE_INDEXTTS_DIR, …). The one-click
+# installer persists these via prefs.json `env.*` (restored at startup in
+# main.py); merging them here lets users inspect/clear them from the same
+# Settings env panel as every other persisted var. Single-sourced from the
+# installer's SPECS so a future sidecar engine can't forget to register.
+try:
+    from services.sidecar_install import persistent_env_vars as _sidecar_env_vars
+    PERSISTENT_KEYS |= _sidecar_env_vars()
+except Exception:  # pragma: no cover — defensive: env panel > installer wiring
+    pass
 
 # Keys whose value must be a valid TCP port (1024–65535). Validated before
 # being set so a bad value never reaches uvicorn / the share listener.
 _PORT_KEYS = {"OMNIVOICE_PORT", "OMNIVOICE_SHARE_PORT", "OMNIVOICE_UI_PORT"}
+
+# Keys whose value is a wall-clock compute-time budget in seconds (#1787).
+# Validated the same way as _PORT_KEYS: reject anything that isn't a
+# positive number before it reaches services/model_manager.py. Upper bound is
+# generous — long enough that a legitimate multi-hour, audiobook-length CPU
+# render is never blocked — but still bounded, so a fat-fingered extra digit
+# (300 -> 3000000) can't turn a wedged job into one that silently occupies a
+# worker for days before the guard ever fires.
+_TIMEOUT_KEYS = {"OMNIVOICE_GENERATE_TIMEOUT_S", "OMNIVOICE_CPU_GENERATE_TIMEOUT_S"}
+_MAX_GENERATE_TIMEOUT_S = 21600.0  # 6 hours
 
 
 @router.post("/system/set-env")
@@ -600,11 +1057,11 @@ async def set_env_var(body: dict):
     Persistent keys (proxy, FFMPEG_PATH, translation provider keys, …) are
     saved to ``prefs.json`` so they survive backend restarts (restored at
     startup in ``main.py``). HF_TOKEN is persisted via
-    ``huggingface_hub.login()`` (and cleared via ``logout()``). Other keys
+    ``huggingface_hub.login()`` (and cleared with the shared token-file helper). Other keys
     are set on ``os.environ`` for the running process.
 
     The loopback-origin gate that previously lived inline here is now applied
-    at the router level via `dependencies=[Depends(require_loopback)]` on
+    at the router level via `dependencies=[Depends(require_admin)]` on
     `router` — see the top of this file. Every route on this router is
     gated, including this one. The 403 body and behavior are unchanged.
     """
@@ -619,23 +1076,6 @@ async def set_env_var(body: dict):
         )
 
     if value:
-        # Validate executable paths if the user is setting them manually.
-        # Reject control characters / null bytes (defense-in-depth against
-        # path-injection), then require an existing regular file. NOTE: this
-        # endpoint is loopback-only and MUST remain so — a remote caller able
-        # to set FFMPEG_PATH/FFPROBE_PATH could point it at an arbitrary
-        # binary (RCE). Network sharing must never expose /system/set-env.
-        if key in ("FFMPEG_PATH", "FFPROBE_PATH"):
-            if any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Invalid path: control characters are not allowed",
-                )
-            if not os.path.isfile(value):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"File not found: {value}",
-                )
         # Port keys must be a numeric string in the unprivileged range so a
         # typo can't drop the backend onto a privileged port (<1024) or an
         # out-of-range value uvicorn would reject at bind time.
@@ -652,8 +1092,24 @@ async def set_env_var(body: dict):
                     status_code=400,
                     detail=f"Invalid port for {key}: must be between 1024 and 65535.",
                 )
+        if key in _TIMEOUT_KEYS:
+            try:
+                timeout_n = float(value)
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid timeout for {key}: '{value}' is not a number.",
+                )
+            if not (0 < timeout_n <= _MAX_GENERATE_TIMEOUT_S):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Invalid timeout for {key}: must be greater than 0 "
+                        f"and at most {_MAX_GENERATE_TIMEOUT_S:.0f} seconds."
+                    ),
+                )
         os.environ[key] = value
-        logger.info("Set environment variable: %s (length=%d)", key, len(value))
+        logger.info("Environment variable set (length=%d)", len(value))
 
         # Capability 1 / issue #35: HF_TOKEN persists across restarts via
         # huggingface_hub.login() — writes the token to $HF_HOME/token so
@@ -668,22 +1124,22 @@ async def set_env_var(body: dict):
                 # Non-fatal — the runtime env var is still set, so the
                 # current process will still see the token. We just lose
                 # persistence across restarts.
-                logger.warning("Could not persist HF token to disk: %s", e)
+                logger.warning("Could not persist HF token to disk: %s", log_safe(e))
     else:
         os.environ.pop(key, None)
-        logger.info("Cleared environment variable: %s", key)
+        logger.info("Environment variable cleared")
 
         # Mirror the persistence on clear — wipe the saved token file too.
         if key == "HF_TOKEN":
             try:
-                from huggingface_hub import logout as _hf_logout
-                _hf_logout()
-                logger.info("HF token cleared from $HF_HOME/token via logout()")
-            except Exception as e:
-                logger.warning("Could not clear HF token file: %s", e)
+                from services.token_resolver import clear_hf_cli_tokens
+                clear_hf_cli_tokens()
+                logger.info("Local Hugging Face token files cleared")
+            except Exception:
+                raise HTTPException(status_code=500, detail="Could not clear local Hugging Face token files") from None
 
     # HF_TOKEN persistence is handled above via huggingface_hub.login()/
-    # logout() — it never touches prefs.json. Everything else in
+    # clear_hf_cli_tokens() — it never touches prefs.json. Everything else in
     # PERSISTENT_KEYS (proxy, FFMPEG_PATH, translation provider keys, …) is
     # saved to prefs.json so it survives backend restarts (restored at
     # startup in main.py). Non-persistent keys stay process-local.
@@ -694,7 +1150,13 @@ async def set_env_var(body: dict):
         else:
             prefs_delete(prefs_key)
 
-    return {"key": key, "set": bool(value)}
+    # #1787 review fix: tell the caller up front when the value just saved is
+    # being shadowed by an external env var — set at THIS process's startup,
+    # before our own prefs restore ran, so it predicts the next restart too.
+    # A response that just said {"set": True} let the Settings panel promise
+    # a restart would apply a value that never will.
+    from core.prefs import is_env_shadowed
+    return {"key": key, "set": bool(value), "shadowed": is_env_shadowed(key)}
 
 
 @router.post("/clean-audio")
@@ -746,18 +1208,26 @@ async def _do_clean_audio(audio, tmp_dir, clean_id):
     clean_filename = f"mic_{clean_id}.wav"
     final_path = os.path.join(OUTPUTS_DIR, clean_filename)
 
+    conversion_fallback = False
     try:
-        await run_ffmpeg(
+        rc, _, _ = await run_ffmpeg(
             [ffmpeg, "-y", "-i", clean_path, "-ar", "24000", "-ac", "1", final_path],
             timeout=120.0,
         )
+        conversion_fallback = rc != 0
     except asyncio.TimeoutError:
-        pass
-    if not os.path.exists(final_path):
+        conversion_fallback = True
+        logger.warning("Final clean-audio conversion timed out; returning the cleaned source format")
+    if conversion_fallback:
+        shutil.copy2(clean_path, final_path)
+    elif not os.path.exists(final_path):
         shutil.copy2(clean_path, final_path)
 
+    headers = {"X-Clean-Filename": clean_filename}
+    if conversion_fallback:
+        headers["X-Clean-Conversion"] = "fallback"
     return FileResponse(final_path, media_type="audio/wav", filename=clean_filename,
-                        headers={"X-Clean-Filename": clean_filename})
+                        headers=headers)
 
 
 @router.get("/system/asr-backends")
@@ -777,7 +1247,7 @@ def asr_backends():
 def hf_token_state():
     """Return the 3-source HF token cascade state for the Settings UI
     (Wave 2 React panel consumes this). Never returns the raw token —
-    only a masked preview, whoami username, and per-source validity.
+    only a masked preview and local presence; no outbound validation.
     """
     from dataclasses import asdict
     from services import token_resolver
@@ -787,6 +1257,62 @@ def hf_token_state():
         "active": s["active"],
         "sources": [asdict(row) for row in s["sources"]],
     }
+
+
+# ── Error journal ─────────────────────────────────────────────────────────
+
+
+@router.get("/system/errors/recent")
+def recent_errors(limit: int = Query(20, ge=1, le=50)):
+    """Recent unhandled backend errors, newest first — structured, deduped
+    (count per fingerprint), classified (error_class), pre-scrubbed. The
+    bug-report pipeline reads this to auto-attach the most recent backend
+    failure; Settings → Logs can render it as a triage view.
+    """
+    from core import error_journal
+
+    errors = error_journal.recent(limit)
+    return {"errors": errors, "count": len(errors)}
+
+
+# ── Diagnostic bundle ─────────────────────────────────────────────────────
+
+
+@router.post("/system/diagnostic-bundle")
+async def diagnostic_bundle(network: bool = Query(False, description="Include the hub reachability probe")):
+    """Build the drag-onto-a-GitHub-issue zip (core.diagnostic_bundle):
+    self-check report, recent error journal, scrubbed log tails. Returns the
+    local path so the UI can reveal it in the file manager. The path itself
+    is NOT scrubbed — this response never leaves the machine; the zip's
+    *contents* are scrubbed because the zip does.
+    """
+    from core.diagnostic_bundle import build_bundle
+
+    path = await asyncio.to_thread(build_bundle, network)
+    return {"path": path, "filename": os.path.basename(path)}
+
+
+# ── Self-check diagnostics ────────────────────────────────────────────────
+
+
+@router.get(
+    "/system/diagnose",
+    dependencies=[Depends(require_admin_action)],
+)
+async def system_diagnose(
+    network: bool = Query(True, description="Include the HuggingFace hub reachability probe"),
+    deep: bool = Query(False, description="Also load the active engine and synthesize a short utterance (may cold-load the model — minutes on first run)"),
+):
+    """Run the self-check suite (core.diagnose) and return the structured report.
+
+    The hub probe can block up to ~5s (and ``deep=true`` far longer), so the
+    whole run goes through a threadpool; pass ``network=false`` for an
+    instant offline report. Output is pre-scrubbed (core.scrub) — safe to
+    paste into a GitHub issue.
+    """
+    from core.diagnose import run_diagnostics
+
+    return await asyncio.to_thread(run_diagnostics, network, deep)
 
 
 # ── Phase 1 Wave 3 — macOS Gatekeeper quarantine probe (#54) ────────────
@@ -809,12 +1335,21 @@ def quarantine_status():
 # ── Network sharing (loopback-only control surface) ──────────────────────────
 
 @router.get("/system/network/state")
-async def network_state():
+async def network_state(request: Request):
     st = network_share.get_state()
+    # PIN-only server mode permits unauthenticated read-only discovery, but the
+    # PIN is itself a consumption credential. Reveal it only to the native
+    # loopback UI or to a remote caller that already passed the configured
+    # long API-key gate. The boolean lets headless dashboards remain useful.
+    host = request.client.host if request.client else None
+    may_reveal_pin = is_loopback(host) or bool(
+        os.environ.get("OMNIVOICE_API_KEY", "").strip()
+    )
     return {
         "enabled": st.enabled,
         "share_port": st.share_port,
-        "pin": st.pin,
+        "pin": st.pin if may_reveal_pin else None,
+        "pin_required": bool(st.pin),
         "lan_addresses": st.lan_addresses,
     }
 
@@ -845,9 +1380,34 @@ async def tailscale_status():
 
 @router.post("/system/tailscale/enable")
 async def tailscale_enable():
-    return _tailscale.serve_enable()
+    result = _tailscale.serve_enable()
+    if result.get("ok"):
+        return result
+    error = public_failure(
+        logger,
+        "Tailscale serve failed",
+        result.get("error", "unknown error"),
+        response="Tailscale sharing could not be enabled; check the backend log for details.",
+    )
+    return {"ok": False, "error": error}
 
 
 @router.post("/system/tailscale/disable")
 async def tailscale_disable():
     return _tailscale.serve_disable()
+
+
+# ── Local-only usage insights (the user's own numbers, never transmitted) ───
+# This answers "how am I using this?" for the USER by aggregating the history
+# the app has ALREADY written to their own database. It collects nothing new,
+# stores nothing new, and transmits nothing anywhere: the only consumer is the
+# user's own UI over loopback. Read-only, content-free (counts and totals,
+# never the text of a take). Product analytics for the PROJECT is a separate,
+# consent-gated path (core/analytics.py: opt-in PostHog behind the first-run
+# prompt, allowlisted content-free metadata only) — this endpoint stays local
+# regardless of that consent.
+@router.get("/stats/usage")
+def stats_usage():
+    from services.local_stats import usage_summary
+
+    return usage_summary()

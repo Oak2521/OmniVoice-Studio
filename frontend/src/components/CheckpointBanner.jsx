@@ -1,8 +1,7 @@
 import React from 'react';
-import { CheckCircle, ArrowRight, X, Sparkles, Languages, Mic } from 'lucide-react';
+import { CheckCircle, ArrowRight, X, Sparkles, Languages, Mic, AlertTriangle } from 'lucide-react';
 import { Button } from '../ui';
 import { useTranslation } from 'react-i18next';
-import './Misc.css';
 
 /**
  * Phase 4.3 — between-stage checkpoint banner.
@@ -25,11 +24,22 @@ const STAGE_ICONS = {
 
 const STAGE_KEYS = {
   asr: { title: 'checkpoint.asr_title', cta: 'checkpoint.asr_cta', hint: 'checkpoint.asr_hint' },
-  translate: { title: 'checkpoint.translate_title', cta: 'checkpoint.translate_cta', hint: 'checkpoint.translate_hint' },
+  translate: {
+    title: 'checkpoint.translate_title',
+    cta: 'checkpoint.translate_cta',
+    hint: 'checkpoint.translate_hint',
+  },
   done: { title: 'checkpoint.done_title', cta: null, hint: 'checkpoint.done_hint' },
 };
 
-export default function CheckpointBanner({ stage, count, onContinue, onDismiss, continueLoading }) {
+export default function CheckpointBanner({
+  stage,
+  count,
+  onContinue,
+  onDismiss,
+  continueLoading,
+  timingWarnings = 0,
+}) {
   const { t } = useTranslation();
   const icons = STAGE_ICONS[stage];
   const keys = STAGE_KEYS[stage];
@@ -47,18 +57,18 @@ export default function CheckpointBanner({ stage, count, onContinue, onDismiss, 
       <Icon size={14} color={icons.accent} className="ckpt-icon" />
       <div className="ckpt-body">
         <div className="ckpt-head">
-          <span className="ckpt-title">
-            {t(keys.title)}
-          </span>
+          <span className="ckpt-title">{t(keys.title)}</span>
           {typeof count === 'number' && (
-            <span className="ckpt-count">
-              {t('checkpoint.segment', { count })}
-            </span>
+            <span className="ckpt-count">{t('checkpoint.segment', { count })}</span>
           )}
         </div>
-        <span className="ckpt-hint">
-          {t(keys.hint)}
-        </span>
+        <span className="ckpt-hint">{t(keys.hint)}</span>
+        {stage === 'done' && timingWarnings > 0 && (
+          <span className="flex items-center gap-2 text-xs text-[var(--color-warn)]">
+            <AlertTriangle size={14} aria-hidden="true" />
+            {t('checkpoint.timing_review', { count: timingWarnings })}
+          </span>
+        )}
       </div>
       {keys.cta && onContinue && (
         <Button

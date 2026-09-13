@@ -1,5 +1,5 @@
 """
-OmniVoice Studio API — Unit Test Suite
+VoiceStudio API — Unit Test Suite
 Tests all roadmap features: TaskManager, scene detection, lip-sync scoring,
 export endpoints (VTT, SRT, MP3, segments ZIP, stems ZIP), streaming TTS.
 
@@ -74,7 +74,7 @@ def client():
 
     `client=("127.0.0.1", 50000)` makes `request.client.host` resolve to a
     loopback address — required because `backend/api/routers/system.py` is
-    now gated by a router-level `require_loopback` dependency. Tests that
+    now gated by a router-level `require_admin` dependency. Tests that
     deliberately exercise the non-loopback rejection path build their own
     plain `TestClient(app)` (which defaults to host='testclient').
     """
@@ -551,7 +551,7 @@ class TestStreamingTTS:
 def test_set_env_rejects_non_loopback():
     """A TestClient that does NOT override `client=` sets
     `request.client.host = 'testclient'` (non-loopback). The router-level
-    `require_loopback` dependency must return 403 and must NOT mutate
+    `require_admin` dependency must return 403 and must NOT mutate
     os.environ. NOTE: the project-wide `client` fixture is now built with a
     loopback override so most tests see protected routes — this test
     instantiates its own plain client to exercise the rejection path."""
@@ -591,13 +591,65 @@ def test_set_env_allows_loopback():
             json={"key": "HF_TOKEN", "value": "hf_loopback_ok"},
         )
         assert res.status_code == 200
-        assert res.json() == {"key": "HF_TOKEN", "set": True}
+        # `shadowed` (#1787) is additive — HF_TOKEN is never persisted via
+        # prefs.json (it goes through huggingface_hub.login() instead), so it
+        # is never shadow-tracked and always reports False here.
+        assert res.json() == {"key": "HF_TOKEN", "set": True, "shadowed": False}
         assert os.environ.get("HF_TOKEN") == "hf_loopback_ok"
     finally:
         if original is None:
             os.environ.pop("HF_TOKEN", None)
         else:
             os.environ["HF_TOKEN"] = original
+
+
+def test_server_mode_remote_without_api_key_cannot_set_executable_path(monkeypatch, tmp_path):
+    """GHAS #506: bare Docker exposure must not become an executable setter."""
+    from fastapi.testclient import TestClient
+    from main import app
+
+    executable = tmp_path / "ffmpeg"
+    executable.write_bytes(b"not actually executable")
+    original = os.environ.get("FFMPEG_PATH")
+    monkeypatch.setenv("OMNIVOICE_SERVER_MODE", "1")
+    monkeypatch.delenv("OMNIVOICE_API_KEY", raising=False)
+    try:
+        response = TestClient(app, client=("172.17.0.1", 50000)).post(
+            "/system/set-env",
+            json={"key": "FFMPEG_PATH", "value": str(executable)},
+        )
+        assert response.status_code == 403
+        assert os.environ.get("FFMPEG_PATH") == original
+    finally:
+        if original is None:
+            os.environ.pop("FFMPEG_PATH", None)
+        else:
+            os.environ["FFMPEG_PATH"] = original
+
+
+def test_set_env_never_accepts_executable_path_even_with_admin_key(monkeypatch, tmp_path):
+    """Executable selection exists only behind native IPC, never this API."""
+    from fastapi.testclient import TestClient
+    from main import app
+
+    executable = tmp_path / "ffmpeg"
+    executable.write_bytes(b"not actually executable")
+    original = os.environ.get("FFMPEG_PATH")
+    monkeypatch.setenv("OMNIVOICE_SERVER_MODE", "1")
+    monkeypatch.setenv("OMNIVOICE_API_KEY", "s3cret")
+    try:
+        response = TestClient(app, client=("172.17.0.1", 50000)).post(
+            "/system/set-env",
+            headers={"authorization": "Bearer s3cret"},
+            json={"key": "FFMPEG_PATH", "value": str(executable)},
+        )
+        assert response.status_code == 400
+        assert os.environ.get("FFMPEG_PATH") == original
+    finally:
+        if original is None:
+            os.environ.pop("FFMPEG_PATH", None)
+        else:
+            os.environ["FFMPEG_PATH"] = original
 
 
 def test_set_env_loopback_still_validates_allowlist():
@@ -617,9 +669,8 @@ def test_set_env_loopback_still_validates_allowlist():
 
 # ---------------------------------------------------------------------------
 # Router-wide loopback guard — covers the previously-unprotected siblings
-# enumerated in
-# .planning/quick/260518-ivy-add-loopback-origin-check-to-system-set-/
-# 260518-ivy-deferred-items.md. Two representative routes are sampled here:
+# enumerated in the 260518-ivy loopback quick plan (removed with .planning/;
+# see git history). Two representative routes are sampled here:
 #   - /clean-audio  (POST, resource-exhaustion vector)
 #   - /system/info  (GET,  info-disclosure vector)
 # The router-level dependency means every other route on the system router
@@ -655,3 +706,69 @@ def test_system_info_rejects_non_loopback():
     res = non_loopback_client.get("/system/info")
     assert res.status_code == 403
     assert "loopback" in res.json().get("detail", "").lower()
+
+
+def test_static_audio_served_with_canonical_mime():
+    """Regression: `.wav` files served by `/audio` StaticFiles must come back
+    with the IANA-canonical `audio/wav` Content-Type, NOT Python's default
+    `audio/x-wav`.
+
+    The `x-` prefix is vendor-experimental and never IANA-registered. macOS
+    Chrome/Safari MIME-sniff leniently via CoreAudio so playback works there,
+    but Linux Chrome/Firefox (FFmpeg) and Android Chrome (ExoPlayer) strictly
+    honor the declared type and treat `audio/x-wav` as download-only — which
+    silently broke the play button in the web app on those platforms.
+    """
+    from pathlib import Path
+    from fastapi.testclient import TestClient
+    from main import app
+    from core.config import OUTPUTS_DIR
+
+    # Drop a wav into the real OUTPUTS_DIR — the mount serves from there.
+    tmp_wav = Path(OUTPUTS_DIR) / f"__mime_test_{uuid.uuid4().hex[:8]}.wav"
+    tmp_wav.write_bytes(make_wav_bytes(0.1))
+    try:
+        client = TestClient(app)
+        res = client.get(f"/audio/{tmp_wav.name}")
+        assert res.status_code == 200, res.text
+        ct = res.headers.get("content-type", "")
+        assert ct == "audio/wav", (
+            f"Expected audio/wav (IANA canonical), got {ct!r}. "
+            f"Linux/Android browsers reject audio/x-wav as download-only."
+        )
+    finally:
+        tmp_wav.unlink(missing_ok=True)
+
+
+@pytest.mark.parametrize("fail_clear", [False, True])
+def test_system_hf_clear_uses_shared_token_file_cleanup(monkeypatch, tmp_path, fail_clear):
+    from pathlib import Path
+    from fastapi.testclient import TestClient
+    from main import app
+    from core import config
+    from huggingface_hub import constants
+    selected = tmp_path / "selected" / "token"
+    legacy = tmp_path / "legacy" / "token"
+    for path in (selected, legacy):
+        path.parent.mkdir()
+        path.write_text("synthetic-cli-token")
+        path.with_name("stored_tokens").write_text("synthetic-stored")
+    monkeypatch.setattr(constants, "HF_TOKEN_PATH", str(selected))
+    monkeypatch.setattr(config, "HF_CLI_TOKEN_PATHS", (str(selected), str(legacy)))
+    monkeypatch.setenv("HF_TOKEN", "synthetic-env")
+    if fail_clear:
+        original = Path.unlink
+        def unlink(path, *args, **kwargs):
+            if path == selected:
+                raise PermissionError("synthetic-private-content")
+            return original(path, *args, **kwargs)
+        monkeypatch.setattr(Path, "unlink", unlink)
+    response = TestClient(app, client=("127.0.0.1", 12345)).post(
+        "/system/set-env", json={"key": "HF_TOKEN", "value": ""}
+    )
+    assert response.status_code == (500 if fail_clear else 200)
+    assert "synthetic-private-content" not in response.text
+    assert not legacy.exists()
+    assert not legacy.with_name("stored_tokens").exists()
+    assert selected.exists() == fail_clear
+    assert "HF_TOKEN" not in os.environ

@@ -1,6 +1,6 @@
 import { API, apiJson, apiPost, apiFetch } from './client';
 
-export interface MissingModel {
+interface MissingModel {
   repo_id: string;
   label: string;
 }
@@ -14,20 +14,8 @@ export interface SetupStatus {
   enough_disk: boolean;
 }
 
-export interface SetupProgressEvent {
-  filename: string;
-  downloaded: number;
-  total: number;
-  pct: number;
-  phase: 'start' | 'progress' | 'done';
-}
-
 export async function setupStatus(): Promise<SetupStatus> {
   return apiJson<SetupStatus>('/setup/status');
-}
-
-export async function setupWarmup(): Promise<{ status: string }> {
-  return apiPost<{ status: string }>('/setup/warmup');
 }
 
 export function setupDownloadStreamUrl(): string {
@@ -36,7 +24,7 @@ export function setupDownloadStreamUrl(): string {
 
 // ── Model store ───────────────────────────────────────────────────────────
 
-export interface KnownModel {
+interface KnownModel {
   repo_id: string;
   label: string;
   role: 'TTS' | 'ASR' | 'Diarisation' | string;
@@ -44,14 +32,32 @@ export interface KnownModel {
   required: boolean;
   note?: string;
   installed: boolean;
+  /** Truncated download on disk (config landed, weight shard didn't). */
+  incomplete?: boolean;
   size_on_disk_bytes: number;
   nb_files: number;
+  /** False when the model can't run on this host (`platforms` in models.yaml). */
+  supported?: boolean;
+  /** Curated "best for your system" pick (`curated_on` in models.yaml) —
+   *  drives the recommended badge in the wizard and Settings model store. */
+  curated?: boolean;
+  platforms?: string[];
+  /** Dictation runtime marker (`engine: sherpa-onnx` in models.yaml). */
+  engine?: string;
+  dictation_id?: string;
+  /** Dictation mode: 'offline' | 'streaming'. */
+  tag?: string;
 }
 
 export interface ModelList {
   models: KnownModel[];
   total_installed_bytes: number;
   hf_cache_dir: string;
+  /** Free space on the cache volume — surfaced in the Model Store header so an
+   *  "Install all" can't silently overrun the disk. */
+  disk_free_gb?: number;
+  /** Host platform tags (e.g. ['darwin', 'darwin-arm64']). */
+  platform_tags?: string[];
 }
 
 export async function listModels(): Promise<ModelList> {
@@ -62,9 +68,15 @@ export async function installModel(repo_id: string): Promise<{ status: string; r
   return apiPost('/models/install', { repo_id });
 }
 
+/** Request cancellation of an in-flight install (FDL-11). Best-effort: the
+ *  backend stops further retries and emits an `install_cancelled` SSE event. */
+export async function cancelInstallModel(repo_id: string): Promise<{ cancelling: string }> {
+  return apiPost('/models/install/cancel', { repo_id });
+}
+
 // ── Device-aware model recommendation ─────────────────────────────────────
 
-export interface RecommendedModel {
+interface RecommendedModel {
   repo_id: string;
   label: string;
   role: string;
@@ -96,7 +108,9 @@ export async function getRecommendations(): Promise<Recommendations> {
   return apiJson<Recommendations>('/setup/recommendations');
 }
 
-export async function deleteModel(repo_id: string): Promise<{ deleted: boolean; repo_id: string; freed_bytes: number }> {
+export async function deleteModel(
+  repo_id: string,
+): Promise<{ deleted: boolean; repo_id: string; freed_bytes: number }> {
   // HF repo_ids look like "owner/name" — encode each segment so special chars
   // are escaped but the literal "/" survives into FastAPI's `:path` converter.
   // encodeURIComponent on the whole string would turn "/" into "%2F", which
@@ -108,9 +122,9 @@ export async function deleteModel(repo_id: string): Promise<{ deleted: boolean; 
 
 // ── Pre-flight system check ───────────────────────────────────────────────
 
-export type CheckStatus = 'pass' | 'warn' | 'fail';
+type CheckStatus = 'pass' | 'warn' | 'fail';
 
-export interface PreflightCheck {
+interface PreflightCheck {
   id: string;
   label: string;
   status: CheckStatus;
@@ -118,7 +132,7 @@ export interface PreflightCheck {
   fix: string | null;
 }
 
-export interface PreflightDevice {
+interface PreflightDevice {
   os: string;
   arch: string;
   gpu_vendor: 'nvidia' | 'amd' | 'apple' | 'intel' | 'unknown' | 'none';
@@ -140,4 +154,3 @@ export interface PreflightReport {
 export async function preflight(): Promise<PreflightReport> {
   return apiJson<PreflightReport>('/setup/preflight');
 }
-

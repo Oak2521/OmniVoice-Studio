@@ -27,6 +27,12 @@ Test-only crash hook (only when OMNIVOICE_ECHO_CRASH=1): the sidecar will
 self-`os._exit(1)` after dispatching exactly one frame, to exercise the
 parent's "sidecar died mid-generate" recovery path.
 
+Test-only handshake hooks (only with OMNIVOICE_ECHO_TEST_MODE=1), checked
+before the ready frame: OMNIVOICE_ECHO_EXIT_BEFORE_READY=<code> exits with
+that code, OMNIVOICE_ECHO_STALL_BEFORE_READY=1 sleeps past any test deadline,
+OMNIVOICE_ECHO_ERROR_BEFORE_READY=<message> sends an error frame, and
+OMNIVOICE_ECHO_WRONG_READY=1 sends a pong instead of ready (#2026).
+
 This script is stdlib-only on purpose — no torch, no numpy. The whole point
 of the echo sidecar is that it can spawn under the bare system Python
 interpreter without any engine venv.
@@ -78,10 +84,47 @@ def _silence_pcm_b64(sample_rate: int) -> tuple[str, int]:
 
 def main() -> int:
     stdin = sys.stdin.buffer
-    stdout = sys.stdout.buffer
+    # Frames go down a PRIVATE fd, and fd 1 is pointed at stderr (#1428).
+    #
+    # This sidecar's protocol is length-prefixed binary on stdout, but it is
+    # not the only thing writing there: the libraries it loads print freely to
+    # fd 1 — wetextprocessing's FST logs, tqdm bars, native prints from torch
+    # and ONNX runtime. Those bytes interleave with frames, and the parent
+    # then reads four bytes of log text as a length prefix, which is how a
+    # generation dies with `OSError: frame too large: 1044258881` (that number
+    # is ASCII). Worse, it desyncs the stream, so every later request on the
+    # same sidecar reads stale bytes and no retry can recover.
+    #
+    # Duplicating fd 1 first keeps a clean channel only this module can write
+    # to; redirecting fd 1 to fd 2 sends the library noise to stderr, which
+    # the parent already drains into its own log (through the HF-token
+    # redactor). Nothing is lost and the frame stream cannot be corrupted.
+    _frame_fd = os.dup(1)
+    os.dup2(2, 1)
+    stdout = os.fdopen(_frame_fd, "wb")
 
     test_mode = os.environ.get("OMNIVOICE_ECHO_TEST_MODE") == "1"
     crash_after_one = os.environ.get("OMNIVOICE_ECHO_CRASH") == "1"
+
+    # Test-only ready-handshake failures (#2026): exit, stall, or answer
+    # with the wrong op before the ready frame, so the parent's report of
+    # each can be checked.
+    if test_mode:
+        early_exit = os.environ.get("OMNIVOICE_ECHO_EXIT_BEFORE_READY")
+        if early_exit:
+            print("echo: exiting before ready on purpose", file=sys.stderr, flush=True)
+            return int(early_exit)
+        if os.environ.get("OMNIVOICE_ECHO_STALL_BEFORE_READY") == "1":
+            import time
+
+            print("echo: stalling before ready on purpose", file=sys.stderr, flush=True)
+            time.sleep(60)
+        error_message = os.environ.get("OMNIVOICE_ECHO_ERROR_BEFORE_READY")
+        if error_message:
+            _send(stdout, {"op": "error", "stage": "startup", "message": error_message})
+            return 1
+        if os.environ.get("OMNIVOICE_ECHO_WRONG_READY") == "1":
+            _send(stdout, {"op": "pong"})
 
     _send(stdout, {"op": "ready", "engine": "_echo"})
 
@@ -101,6 +144,12 @@ def main() -> int:
             return 0
 
         op = msg.get("op")
+        # Wave 4.2: deterministic "crash mid-transcription" hook — exit BEFORE
+        # sending any reply so the parent's blocking recv sees a dead pipe
+        # (reply=None). The crash-after-one hook below replies first, so it
+        # can't deterministically exercise the no-reply path.
+        if op == "transcribe" and os.environ.get("OMNIVOICE_ECHO_CRASH_NO_REPLY") == "1":
+            os._exit(1)
         try:
             if op == "ping":
                 _send(stdout, {"op": "pong"})
@@ -112,6 +161,19 @@ def main() -> int:
                     "audio_pcm_b64": pcm_b64,
                     "sample_rate": sr,
                     "n_samples": n_samples,
+                })
+            elif op == "transcribe":
+                # Wave 4.2: echo ASR op — a canned segments result so the
+                # SubprocessASRBackend round-trip + respawn path is testable
+                # without a real ASR engine.
+                _send(stdout, {
+                    "op": "segments",
+                    "result": {
+                        "segments": [{"start": 0.0, "end": 1.0,
+                                      "text": f"echo:{msg.get('audio_path', '')}"}],
+                        "text": f"echo:{msg.get('audio_path', '')}",
+                        "language": "en",
+                    },
                 })
             elif op == "shutdown":
                 return 0

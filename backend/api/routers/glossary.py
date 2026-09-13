@@ -189,15 +189,21 @@ def auto_extract(project_id: str, req: AutoExtractRequest):
     Writes them as `auto=1` rows. Existing terms with the same (source,target)
     are NOT duplicated. Returns the full current glossary after the pass.
     """
-    from services.translator import _llm_client, _llm_model, _llm_timeout  # reuse same client
+    # Resolved through the LLM Skills registry so auto-extract can be toggled
+    # or routed to its own provider (Settings → LLM Skills) independently of
+    # the translation pipeline. None == disabled or no provider configured.
+    from services import llm_skills
 
-    client = _llm_client()
-    if client is None:
+    handle = llm_skills.resolve_skill_client("glossary_extract")
+    if handle is None:
         raise HTTPException(
             status_code=503,
             detail=(
-                "Auto-extract needs an LLM. Set TRANSLATE_BASE_URL + TRANSLATE_API_KEY "
-                "(Ollama works locally: base_url=http://localhost:11434/v1) and try again."
+                "Auto-extract needs an LLM. Set one up in Settings → LLM Providers "
+                "(pick a provider, add its key, choose a model, Test) — or use local "
+                "Ollama / LM Studio for a fully offline setup — and make sure the "
+                "Glossary auto-extract skill is enabled in Settings → LLM Skills, "
+                "then try again."
             ),
         )
 
@@ -220,9 +226,9 @@ def auto_extract(project_id: str, req: AutoExtractRequest):
     )
 
     try:
-        res = client.chat.completions.create(
-            model=_llm_model(),
-            timeout=_llm_timeout(),
+        res = handle.client.chat.completions.create(
+            model=handle.model,
+            timeout=handle.timeout,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
@@ -231,9 +237,18 @@ def auto_extract(project_id: str, req: AutoExtractRequest):
         body = (res.choices[0].message.content or "").strip()
     except Exception as e:
         logger.warning("auto-extract LLM call failed: %s", e)
+        # Scrub the provider error — some OpenAI-compatible providers echo the
+        # API key or a user_id in the body, which must not reach the UI verbatim.
+        from core.scrub import scrub_provider_error
+        from services import llm_providers
+        _p = llm_providers.active_provider()
+        _key = llm_providers.resolve_api_key(_p) if _p else None
         raise HTTPException(
             status_code=502,
-            detail=f"LLM didn't respond. Check Settings → Logs → Backend for the trace. Error: {e}",
+            detail=(
+                "LLM didn't respond. Check Settings → Logs → Backend for the trace. "
+                f"Error: {scrub_provider_error(e, _key)}"
+            ),
         )
 
     # Parse: SOURCE || TARGET || note (lines are allowed to be sloppy — we're forgiving).

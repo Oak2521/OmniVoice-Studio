@@ -1,0 +1,121 @@
+# MCP server — let agents speak in your voice
+
+VoiceStudio ships an [MCP](https://modelcontextprotocol.io/) server so AI agents
+(Claude Code, Cursor, …) can synthesize speech, clone voices, transcribe audio,
+and list your voices — locally, in a voice you choose per agent. The server is
+**mounted on the running backend** at `/mcp`, so there's nothing extra to
+start once VoiceStudio is open.
+
+## Tools
+
+| Tool | What it does |
+|---|---|
+| `generate_speech` | text → WAV. Uses the agent's bound voice unless a `profile_id` is passed. Returns base64 by default, or a URL + file in [files mode](#output-mode-and-file-inputs). |
+| `clone_voice` | reference audio (base64, or a `ref_audio_path` under the base path) → new voice profile. Returns a `profile_id` for use with `generate_speech`. |
+| `transcribe` | audio (base64, or an `audio_path` under the base path) → text (646 languages). |
+| `list_voices` / `list_personalities` / `list_languages` | enumerate what's available. |
+| `check_health` | backend status + active GPU device. |
+
+## Output mode and file inputs
+
+An LLM agent pays for every byte it receives in context, and a WAV as base64
+is a lot of bytes — a short clip already brushes per-result limits, a
+paragraph of narration blows them. Two environment variables move the audio
+out of the conversation and onto disk, where an agent can hand it to a player
+or another tool by path:
+
+| Variable | Values | Effect |
+|---|---|---|
+| `OMNIVOICE_MCP_OUTPUT_MODE` | `resources` (default) · `files` · `both` | `resources` returns `wav_base64` inline (the original contract). `files` returns `audio_url` (the render served at `/audio/<audio_id>.wav`, which the backend keeps anyway) and, when a base path is set, `output_path` — the WAV written into that directory. `both` returns everything. |
+| `OMNIVOICE_MCP_TIMEOUT_S` | seconds (default: follows the backend) | How long a tool waits on the backend. Unset, each tool waits as long as the backend itself would, plus 30 s, and never less than 120 s. `transcribe` follows `OMNIVOICE_ASR_TRANSCRIBE_TIMEOUT_S` (300 s by default, queue time included). `generate_speech` follows the backend's queue wait (`OMNIVOICE_GPU_QUEUE_TIMEOUT_S`, 1,800 s by default) plus the larger of `OMNIVOICE_GENERATE_TIMEOUT_S` and `OMNIVOICE_CPU_GENERATE_TIMEOUT_S`, plus 1 s per 40 characters past 1,200. The agent then gets the backend's own timeout error instead of an empty one. Set this to use one fixed wait for every tool. On a machine that hasn't downloaded the OmniVoice model yet, the first `generate_speech` also downloads it (about 2.3 GB) inside the backend's budget: install the model first (first-run setup, or Model Catalogue) or raise `OMNIVOICE_GENERATE_TIMEOUT_S` before the first call. |
+| `OMNIVOICE_MCP_BASE_PATH` | a directory | The **security boundary** for file-shaped traffic. `transcribe(audio_path=…)` and `clone_voice(ref_audio_path=…)` read only from inside it (relative paths resolve against it, absolute paths must already lie within it, symlinks are resolved before the check), and files mode writes only into it. With no base path configured, path arguments are refused with a reason. |
+
+Input files are opened through confined, no-follow descriptors after path
+validation, so replacing a checked file or parent directory cannot redirect a
+read outside the base path.
+
+Set them on the **backend's** environment for the mounted `/mcp` endpoint
+(the launcher, a service file, Docker `-e`), or on the server entry's `env`
+when running `python -m backend.mcp_server` standalone. The base path must be
+visible to both the backend and the agent. If they run in different containers
+or filesystem namespaces, mount one shared directory at the same path in both;
+`output_path` is reported in the backend's namespace. The agent's working
+directory is suitable only when that shared mount exists. With this setup,
+`OMNIVOICE_MCP_OUTPUT_MODE=files` keeps every render out of agent context while
+still returning a path the agent can use.
+
+## Connecting
+
+### Streamable HTTP (modern clients)
+
+Point your client at the mounted endpoint:
+
+```
+http://localhost:3900/mcp
+```
+
+To bind this agent to a specific voice, send an
+`X-VoiceStudio-Client-Id` header (e.g. `claude-code`). See
+[per-agent voices](#per-agent-voices).
+
+**Agents in Docker or on another machine:** the MCP SDK rejects non-localhost
+Host headers by default (DNS-rebinding guard). Set
+`OMNIVOICE_MCP_ALLOWED_HOSTS` to a comma-separated list of host patterns the
+agent connects from (e.g. `host.containers.internal:*,192.168.1.50:*`).
+Keep this on a trusted LAN or behind TLS (Tailscale Serve, a reverse proxy
+with HTTPS) — the MCP transport is not authenticated, so don't expose it on
+the open internet.
+
+### stdio (clients that only speak stdio)
+
+Use the bundled shim — it proxies stdio ↔ the mounted HTTP endpoint. Drop
+this into your client's MCP config (`docs/mcp.json` is a template):
+
+```json
+{
+  "mcpServers": {
+    "omnivoice": {
+      "command": "python",
+      "args": ["-m", "backend.mcp_shim"],
+      "cwd": "/path/to/VoiceStudio",
+      "env": { "OMNIVOICE_PORT": "3900", "OMNIVOICE_CLIENT_ID": "claude-code" }
+    }
+  }
+}
+```
+
+The shim forwards `OMNIVOICE_CLIENT_ID` as the `X-VoiceStudio-Client-Id` header,
+so the per-agent voice binding works the same as the HTTP path. It waits for
+the backend to be up, relays JSON-RPC, and exits cleanly when the client
+closes.
+
+## Per-agent voices
+
+Each agent identifies itself with a **client id**. Bind a client id to a voice
+profile so different agents speak differently — "Claude Code in Morgan, Cursor
+in Scarlett". Voice resolution precedence on every `generate_speech` call:
+
+1. an explicit `profile_id` argument, else
+2. the calling agent's binding, else
+3. the global default voice, else
+4. VoiceStudio's default voice.
+
+Manage bindings over the loopback REST API (the Settings UI uses these):
+
+```bash
+# list
+curl localhost:3900/api/mcp/bindings
+# bind claude-code → a voice profile
+curl -X PUT localhost:3900/api/mcp/bindings \
+  -H 'Content-Type: application/json' \
+  -d '{"client_id":"claude-code","label":"Claude Code","profile_id":"<voice-profile-id>"}'
+# remove
+curl -X DELETE localhost:3900/api/mcp/bindings/claude-code
+```
+
+Prefer a [consent-verified](../docs/competitive-analysis.md) voice profile for
+any agent that speaks as you.
+
+## Disabling
+
+Set `OMNIVOICE_MCP_DISABLE=1` to skip mounting `/mcp` entirely.

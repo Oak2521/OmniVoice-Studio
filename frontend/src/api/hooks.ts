@@ -4,7 +4,9 @@
 // Deduplication is automatic — two components using useSysinfo() share one
 // network request and one cache entry.
 
+import { useMemo } from 'react';
 import { useQuery, useMutation, useQueryClient, keepPreviousData } from '@tanstack/react-query';
+import { useAppStore } from '../store';
 import * as systemApi from './system';
 import * as setupApi from './setup';
 import * as galleryApi from './gallery';
@@ -12,23 +14,27 @@ import * as archetypesApi from './archetypes';
 import type { ArchetypeFilters } from './archetypes';
 import * as communityApi from './community';
 import type { CommunityFilters } from './community';
+import * as enginesApi from './engines';
+import type { AllEnginesResponse, EngineFamily } from './types';
 
 // ── Keys (prevents typos, enables targeted invalidation) ─────────────────
 export const queryKeys = {
-  sysinfo:         ['sysinfo']         as const,
-  modelStatus:     ['model-status']    as const,
-  systemInfo:      ['system-info']     as const,
-  systemLogs:      (tail?: number) => ['system-logs', tail ?? 300] as const,
-  tauriLogs:       (tail?: number) => ['tauri-logs',  tail ?? 300] as const,
-  models:          ['models']          as const,
+  sysinfo: ['sysinfo'] as const,
+  modelStatus: ['model-status'] as const,
+  notifications: ['notifications'] as const,
+  systemInfo: ['system-info'] as const,
+  systemLogs: (tail?: number) => ['system-logs', tail ?? 300] as const,
+  tauriLogs: (tail?: number) => ['tauri-logs', tail ?? 300] as const,
+  models: ['models'] as const,
   recommendations: ['recommendations'] as const,
-  preflight:       ['preflight']       as const,
-  setupStatus:     ['setup-status']    as const,
-  galleryVoices:   (params?: any) => ['gallery-voices', params] as const,
+  preflight: ['preflight'] as const,
+  engines: ['engines'] as const,
+  setupStatus: ['setup-status'] as const,
+  galleryVoices: (params?: any) => ['gallery-voices', params] as const,
   galleryCategories: ['gallery-categories'] as const,
   archetypeCategories: ['archetype-categories'] as const,
-  archetypes:      (filters?: any) => ['archetypes', filters] as const,
-  communityItems:  (filters?: any) => ['community-items', filters] as const,
+  archetypes: (filters?: any) => ['archetypes', filters] as const,
+  communityItems: (filters?: any) => ['community-items', filters] as const,
   communityManifest: (refresh?: boolean) => ['community-manifest', !!refresh] as const,
 };
 
@@ -39,7 +45,7 @@ export function useSysinfo(enabled = true) {
     queryKey: queryKeys.sysinfo,
     queryFn: systemApi.sysinfo,
     refetchInterval: 5_000,
-    refetchIntervalInBackground: true,
+    refetchIntervalInBackground: false,
     retry: Infinity,
     retryDelay: 1_500,
     enabled,
@@ -63,21 +69,70 @@ export function useModelStatus(enabled = true) {
   });
 }
 
-export function useSystemLogs(tail = 300, enabled = true) {
+// Shared by the header bell (NotificationPanel) and the LogsFooter
+// notifications tab — one request, one cache entry.
+export function useNotifications(enabled = true) {
+  return useQuery({
+    queryKey: queryKeys.notifications,
+    queryFn: systemApi.systemNotifications,
+    refetchInterval: 30_000,
+    refetchIntervalInBackground: false,
+    retry: Infinity,
+    retryDelay: 1_500,
+    enabled,
+  });
+}
+
+/** A system notification the user may hide: info/warn describe standing facts
+ * (CPU-only box, low disk) that can be acknowledged; errors describe broken
+ * things that stay visible until actually fixed. */
+export function isDismissibleNotification(n: { level?: string }): boolean {
+  return n?.level === 'info' || n?.level === 'warn';
+}
+
+// The bell and the footer tab must agree on what is visible, so the
+// dismissed-ids filter lives here, next to the query they share. Dismissals
+// persist in the app store (prefsSlice.dismissedNotificationIds); the backend
+// keeps re-emitting the note every poll, which is exactly why filtering is
+// client-side — see the slice doc for the id-stability contract.
+export function useVisibleNotifications(enabled = true) {
+  const query = useNotifications(enabled);
+  const dismissed = useAppStore((s) => s.dismissedNotificationIds);
+  const all = query.data?.notifications;
+  // Memoized so the array reference is stable across re-renders while the
+  // inputs are unchanged (downstream effect/memo deps stay quiet).
+  // A note is hidden only while it is *currently* dismissible: if a stable id
+  // ever escalates to error level, an old info/warn dismissal must not hide it.
+  const notifications = useMemo(
+    () =>
+      (all || []).filter(
+        (n: { id?: string; level?: string }) =>
+          !n.id || !isDismissibleNotification(n) || !dismissed.includes(n.id),
+      ),
+    [all, dismissed],
+  );
+  // Omit `data` from the returned query: `data.notifications` is the raw
+  // UNFILTERED list, and any consumer reaching for it would silently bypass
+  // the dismiss filter. (No consumer uses `data` today.)
+  const { data: _data, ...rest } = query;
+  return { ...rest, notifications };
+}
+
+export function useSystemLogs(tail = 300, enabled = true, refetchInterval = 10_000) {
   return useQuery({
     queryKey: queryKeys.systemLogs(tail),
     queryFn: () => systemApi.systemLogs(tail),
-    refetchInterval: 10_000,
+    refetchInterval,
     refetchIntervalInBackground: false,
     enabled,
   });
 }
 
-export function useTauriLogs(tail = 300, enabled = true) {
+export function useTauriLogs(tail = 300, enabled = true, refetchInterval = 10_000) {
   return useQuery({
     queryKey: queryKeys.tauriLogs(tail),
     queryFn: () => systemApi.systemLogsTauri(tail),
-    refetchInterval: 10_000,
+    refetchInterval,
     refetchIntervalInBackground: false,
     enabled,
   });
@@ -119,19 +174,44 @@ export function usePreflight() {
   });
 }
 
+/**
+ * The app-wide engine inventory.  Engine selection affects more than the
+ * catalogue (for example Audiobook's expressive controls), so every consumer
+ * must share this cache rather than take its own one-off snapshot.
+ *
+ * `queryFn` is injectable for the compatibility-matrix test seam.
+ */
+export function useEngines(queryFn: () => Promise<AllEnginesResponse> = enginesApi.listEngines) {
+  return useQuery({
+    queryKey: queryKeys.engines,
+    queryFn,
+    staleTime: 30_000,
+    retry: 1,
+  });
+}
+
+/** Select an engine and invalidate every view derived from `/engines`. */
+export function useSelectEngine() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      family,
+      backendId,
+      modelId,
+    }: {
+      family: EngineFamily;
+      backendId: string;
+      modelId?: string;
+    }) => enginesApi.selectEngine(family, backendId, modelId),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: queryKeys.engines }),
+  });
+}
+
 export function useSetupStatus() {
   return useQuery({
     queryKey: queryKeys.setupStatus,
     queryFn: setupApi.setupStatus,
     staleTime: 10_000,
-  });
-}
-
-export function useGalleryCategories() {
-  return useQuery({
-    queryKey: queryKeys.galleryCategories,
-    queryFn: galleryApi.listCategories,
-    staleTime: 60_000,
   });
 }
 
@@ -153,12 +233,16 @@ export function useArchetypeCategories() {
   });
 }
 
-export function useArchetypes(filters: ArchetypeFilters = {}) {
+// `enabled` lets a shared consumer (VoiceSelector) defer the fetch until its
+// dropdown actually opens — many pickers can mount (e.g. the Audiobook cast
+// list) without any of them hitting the network until used.
+export function useArchetypes(filters: ArchetypeFilters = {}, enabled = true) {
   return useQuery({
     queryKey: queryKeys.archetypes(filters),
     queryFn: () => archetypesApi.listArchetypes(filters),
     staleTime: 5 * 60_000,
     placeholderData: keepPreviousData, // v5: keep prior page visible while paginating
+    enabled,
   });
 }
 
@@ -172,14 +256,6 @@ export function useCommunityItems(filters: CommunityFilters = {}) {
   });
 }
 
-export function useCommunityManifest(refresh = false) {
-  return useQuery({
-    queryKey: queryKeys.communityManifest(refresh),
-    queryFn: () => communityApi.communityManifest(refresh),
-    staleTime: 5 * 60_000,
-  });
-}
-
 // ── Mutations ────────────────────────────────────────────────────────────
 
 export function useInstallModel() {
@@ -190,6 +266,9 @@ export function useInstallModel() {
       qc.invalidateQueries({ queryKey: queryKeys.models });
       qc.invalidateQueries({ queryKey: queryKeys.setupStatus });
       qc.invalidateQueries({ queryKey: queryKeys.recommendations });
+      // Some model installs make an engine selectable; refresh every engine
+      // indicator rather than leaving a stale unavailable snapshot behind.
+      qc.invalidateQueries({ queryKey: queryKeys.engines });
     },
   });
 }
@@ -202,37 +281,7 @@ export function useDeleteModel() {
       qc.invalidateQueries({ queryKey: queryKeys.models });
       qc.invalidateQueries({ queryKey: queryKeys.setupStatus });
       qc.invalidateQueries({ queryKey: queryKeys.recommendations });
-    },
-  });
-}
-
-export function useFlushMemory() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (unloadModel: boolean) => systemApi.flushMemory(unloadModel),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: queryKeys.sysinfo });
-      qc.invalidateQueries({ queryKey: queryKeys.modelStatus });
-    },
-  });
-}
-
-export function useClearLogs() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: () => systemApi.clearSystemLogs(),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: queryKeys.systemLogs() });
-    },
-  });
-}
-
-export function useClearTauriLogs() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: () => systemApi.clearTauriLogs(),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: queryKeys.tauriLogs() });
+      qc.invalidateQueries({ queryKey: queryKeys.engines });
     },
   });
 }

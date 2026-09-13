@@ -1,8 +1,10 @@
 import React from 'react';
-import { AlertCircle, BookOpen, RefreshCw } from 'lucide-react';
+import { AlertCircle, BookOpen, Bug, RefreshCw, Search } from 'lucide-react';
 import i18next from 'i18next';
 import { classifyError, openDocsFor } from '../utils/errorDocsMap';
-import './WaveformErrorBoundary.css';
+import { openExternal } from '../api/external';
+import { buildIssueSearchUrl, openBugReport } from '../utils/bugReport';
+import { Button } from '../ui';
 
 export default class ErrorBoundary extends React.Component {
   constructor(props) {
@@ -36,36 +38,83 @@ export default class ErrorBoundary extends React.Component {
     }
   };
 
+  report = async () => {
+    // Prefilled GitHub Issues URL with the scrubbed error attached — the
+    // user reviews everything on github.com before anything is submitted.
+    try {
+      await openBugReport({ error: this.state.error });
+    } catch (err) {
+      console.warn('[ErrorBoundary] report failed', err);
+    }
+  };
+
+  searchIssues = async () => {
+    // "Has someone already hit this?" — issue search in the browser, so a
+    // duplicate gets a 👍 on the existing thread instead of a new report.
+    try {
+      await openExternal(buildIssueSearchUrl(this.state.error));
+    } catch (err) {
+      console.warn('[ErrorBoundary] issue search failed', err);
+    }
+  };
+
   render() {
     if (!this.state.error) return this.props.children;
 
     const msg = this.state.error?.message || String(this.state.error);
     return (
-      <div className="errbnd-wrap">
-        <div className="errbnd-card">
-          <AlertCircle size={32} color="var(--chrome-severity-err)" className="errbnd-icon" />
-          <h2 className="errbnd-title">
+      <div className="flex flex-1 items-center justify-center p-8 font-sans">
+        <div className="w-full max-w-[520px] rounded-[var(--chrome-radius-pill)] border border-[color:color-mix(in_srgb,var(--chrome-severity-err)_35%,transparent)] border-l-2 border-l-[var(--chrome-severity-err)] bg-[var(--chrome-bg)] p-[22px] text-center">
+          <AlertCircle
+            size={32}
+            color="var(--chrome-severity-err)"
+            className="mb-2.5 inline-block"
+          />
+          <h2 className="m-0 mb-1.5 font-serif text-[1.6rem] font-normal italic tracking-[-0.01em] text-[var(--chrome-fg)]">
             {i18next.t('errors.title')}
           </h2>
-          <p className="errbnd-desc">
+          <p className="m-0 mb-3 text-[0.82rem] leading-[1.5] text-[var(--chrome-fg-muted)]">
             {i18next.t('errors.desc')}
           </p>
-          <pre className="errbnd-trace">{msg}</pre>
-          <div className="errbnd-actions">
-            <button
+          <pre className="m-0 mb-3.5 max-h-[140px] overflow-auto rounded-[var(--chrome-radius-pill)] border border-transparent bg-[var(--chrome-hover-bg)] px-2.5 py-2 text-left font-mono text-[0.72rem] text-[var(--chrome-severity-err)]">
+            {msg}
+          </pre>
+          <div className="flex flex-wrap justify-center gap-2">
+            <Button
+              variant="primary"
+              size="sm"
               onClick={this.reset}
-              className="btn-primary errbnd-retry"
+              leading={<RefreshCw size={12} />}
             >
-              <RefreshCw size={12} /> {i18next.t('errors.tryAgain')}
-            </button>
-            <button
-              type="button"
+              {i18next.t('errors.tryAgain')}
+            </Button>
+            <Button
+              variant="subtle"
+              size="sm"
               onClick={this.openDocs}
-              className="btn-secondary errbnd-docs"
               title={i18next.t('errors.openDocs')}
+              leading={<BookOpen size={12} />}
             >
-              <BookOpen size={12} /> {i18next.t('errors.openDocs')}
-            </button>
+              {i18next.t('errors.openDocs')}
+            </Button>
+            <Button
+              variant="subtle"
+              size="sm"
+              onClick={this.searchIssues}
+              title={i18next.t('errors.searchIssues')}
+              leading={<Search size={12} />}
+            >
+              {i18next.t('errors.searchIssues')}
+            </Button>
+            <Button
+              variant="subtle"
+              size="sm"
+              onClick={this.report}
+              title={i18next.t('reportBug.title')}
+              leading={<Bug size={12} />}
+            >
+              {i18next.t('errors.report')}
+            </Button>
           </div>
         </div>
       </div>

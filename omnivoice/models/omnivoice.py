@@ -32,6 +32,7 @@ import logging
 import math
 import os
 import re
+import sys
 from dataclasses import dataclass, fields
 from functools import partial
 from typing import Any, List, Optional, Union
@@ -45,7 +46,6 @@ from transformers import (
     AutoFeatureExtractor,
     AutoModel,
     AutoTokenizer,
-    HiggsAudioV2TokenizerModel,
     PretrainedConfig,
     PreTrainedModel,
 )
@@ -53,11 +53,13 @@ from transformers.modeling_outputs import ModelOutput
 from transformers.models.auto import CONFIG_MAPPING, AutoConfig
 
 from omnivoice.utils.audio import (
+    CLONE_REF_NO_SPEECH_MARKER,
+    CLONE_REF_TOO_LONG_MARKER,
     cross_fade_chunks,
     fade_and_pad_audio,
     load_audio,
-    remove_silence,
-    trim_long_audio,
+    remove_silence_safe,
+    validate_clone_reference,
 )
 from omnivoice.utils.duration import RuleDurationEstimator
 from omnivoice.utils.lang_map import LANG_IDS, LANG_NAMES
@@ -74,10 +76,23 @@ from omnivoice.utils.voice_design import (
 
 logger = logging.getLogger(__name__)
 
+_AUDIO_TOKENIZER_FALLBACK_REPO = "eustlb/higgs-audio-v2-tokenizer"
+
+
+class OmniVoiceModelAssetError(RuntimeError):
+    """A fixed nested model repository failed while OmniVoice was loading."""
+
+    def __init__(self, repository_id: str):
+        super().__init__(f"Failed to load OmniVoice model asset: {repository_id}")
+        self.repository_id = repository_id
+
 
 # ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
+
+
+_VOICE_CLONE_PROMPT_FORMAT_VERSION = 1
 
 
 @dataclass
@@ -85,6 +100,51 @@ class VoiceClonePrompt:
     ref_audio_tokens: torch.Tensor  # (C, T)
     ref_text: str
     ref_rms: float
+
+    def save(self, path: str) -> None:
+        """Save this prompt to ``path`` for reuse in a later session.
+
+        The file stores a plain dict with the audio tokens moved to CPU, so
+        it can be loaded with ``torch.load(weights_only=True)`` (the default
+        since torch 2.6) and is portable across devices.
+
+        Args:
+            path: Destination file path (e.g. ``"my_voice.pt"``).
+        """
+        torch.save(
+            {
+                "format_version": _VOICE_CLONE_PROMPT_FORMAT_VERSION,
+                "ref_audio_tokens": self.ref_audio_tokens.detach().cpu(),
+                "ref_text": self.ref_text,
+                "ref_rms": float(self.ref_rms),
+            },
+            path,
+        )
+
+    @classmethod
+    def load(cls, path: str, map_location: str = "cpu") -> "VoiceClonePrompt":
+        """Load a prompt saved with :meth:`save`.
+
+        The returned prompt can be passed directly to
+        :meth:`OmniVoice.generate`; the audio tokens are moved to the model
+        device automatically during generation, so no manual ``.to(device)``
+        is needed.
+
+        Args:
+            path: File path previously written by :meth:`save`.
+            map_location: Device to load the audio tokens onto.
+        Returns:
+            The restored :class:`VoiceClonePrompt`.
+        """
+        data = torch.load(path, map_location=map_location, weights_only=True)
+        version = data.get("format_version")
+        if version != _VOICE_CLONE_PROMPT_FORMAT_VERSION:
+            raise ValueError(f"Unsupported VoiceClonePrompt format version: {version}")
+        return cls(
+            ref_audio_tokens=data["ref_audio_tokens"],
+            ref_text=data["ref_text"],
+            ref_rms=data["ref_rms"],
+        )
 
 
 @dataclass
@@ -181,6 +241,63 @@ class OmniVoiceConfig(PretrainedConfig):
         self.audio_codebook_weights = audio_codebook_weights
 
 
+def _audio_tokenizer_cls():
+    """Resolve ``transformers.HiggsAudioV2TokenizerModel`` at the point of use.
+
+    transformers exposes this class through its lazy module and gates it on the
+    ``torchaudio`` backend, so the *attribute access* — not the `transformers`
+    import — is what raises when torchaudio is missing, ABI-mismatched with
+    torch, or installed without discoverable distribution metadata (Colab's
+    system Python, an interrupted `uv pip install`). Resolving it at module
+    scope made that a fatal import error for the WHOLE backend: `backend/main.py`
+    imports the profiles router → `omnivoice` → this module, so one optional
+    audio tokenizer took down TTS, dubbing, ASR and Settings alike, before
+    FastAPI existed to classify it. The user saw only uvicorn's traceback and a
+    "Backend did not become healthy within 5 minutes" timeout (#1229).
+
+    Deferred here, the failure lands inside a request instead, where
+    ``core.failure.classify()`` maps it to ``TRANSFORMERS_IMPORT`` and attaches
+    a repair hint — and every feature that doesn't need this tokenizer keeps
+    working.
+    """
+    try:
+        from transformers import HiggsAudioV2TokenizerModel
+    except Exception as e:
+        raise ImportError(
+            "Could not import module 'HiggsAudioV2TokenizerModel' — OmniVoice's "
+            "audio tokenizer. transformers gates it on torchaudio, so this is "
+            "almost always a torchaudio that is missing, broken, or mismatched "
+            "with the installed torch/transformers. Reinstall them together "
+            "(`uv pip install --reinstall torch torchaudio transformers`; add "
+            "--system on Colab), then restart the backend. Underlying error: "
+            f"{type(e).__name__}: {e}"
+        ) from e
+    return HiggsAudioV2TokenizerModel
+
+
+def _resolve_snapshot_dir(checkpoint) -> str:
+    """Local snapshot directory for ``checkpoint`` (a local dir or a HF repo id).
+
+    Cache-first (#959): a COMPLETE local cache is resolved with
+    ``snapshot_download(..., local_files_only=True)``, which never constructs
+    an HTTP session — so no session-construction failure (e.g. httpx's
+    ImportError under ``ALL_PROXY``/``HTTPS_PROXY=socks5://`` without socksio,
+    a malformed proxy URL, a broken cert bundle) can break synthesis of an
+    already-installed model. Only a cache miss / incomplete cache falls
+    through to the original network ``snapshot_download``, whose errors
+    (auth, connectivity, proxy) surface exactly as before.
+    """
+    if os.path.isdir(checkpoint):
+        return checkpoint
+    from huggingface_hub import snapshot_download
+
+    try:
+        return snapshot_download(checkpoint, local_files_only=True)
+    except Exception:
+        # Miss/incomplete (LocalEntryNotFoundError et al.) → network path.
+        return snapshot_download(checkpoint)
+
+
 class OmniVoice(PreTrainedModel):
     _supports_flex_attn = True
     _supports_flash_attn_2 = True
@@ -248,9 +365,24 @@ class OmniVoice(PreTrainedModel):
         load_asr = kwargs.pop("load_asr", False)
         asr_model_name = kwargs.pop("asr_model_name", "openai/whisper-large-v3-turbo")
 
-        # Suppress noisy INFO logs from transformers/huggingface_hub during loading
-        _prev_disable = logging.root.manager.disable
-        logging.disable(logging.INFO)
+        # Suppress noisy INFO logs from transformers/huggingface_hub during
+        # loading. Scoped to those two logger trees — NOT logging.disable(),
+        # which is process-global and only restored when this call returns: a
+        # SIGTERM mid-load ran the entire app shutdown with INFO logging still
+        # disabled, blacking out every "Shutting down"/"Shutdown: done." line
+        # and making a clean quit look like a silent crash (#1174).
+        _quiet_loggers = [
+            logging.getLogger("transformers"),
+            logging.getLogger("huggingface_hub"),
+        ]
+        _prev_levels = [(lg, lg.level) for lg in _quiet_loggers]
+        for _lg in _quiet_loggers:
+            _lg.setLevel(logging.WARNING)
+
+        # Disable tqdm on non-TTY (e.g., Tauri backend) to prevent OSError on Windows
+        _prev_tqdm = os.environ.get("TQDM_DISABLE")
+        if sys.stdout is not None and not sys.stdout.isatty():
+            os.environ["TQDM_DISABLE"] = "1"
 
         try:
             model = super().from_pretrained(
@@ -258,13 +390,10 @@ class OmniVoice(PreTrainedModel):
             )
 
             if not train_mode:
-                # Resolve local path for audio tokenizer subdirectory
-                if os.path.isdir(pretrained_model_name_or_path):
-                    resolved_path = pretrained_model_name_or_path
-                else:
-                    from huggingface_hub import snapshot_download
-
-                    resolved_path = snapshot_download(pretrained_model_name_or_path)
+                # Resolve local path for audio tokenizer subdirectory —
+                # cache-first so a proxy-broken HTTP session can't fail an
+                # installed model (#959; see _resolve_snapshot_dir).
+                resolved_path = _resolve_snapshot_dir(pretrained_model_name_or_path)
 
                 model.text_tokenizer = AutoTokenizer.from_pretrained(
                     pretrained_model_name_or_path
@@ -275,18 +404,25 @@ class OmniVoice(PreTrainedModel):
                 if not os.path.isdir(audio_tokenizer_path):
                     # Fallback to the HuggingFace Hub path of transformers'
                     # HiggsAudioV2Tokenizer if the local subdirectory doesn't exist.
-                    audio_tokenizer_path = "eustlb/higgs-audio-v2-tokenizer"
+                    audio_tokenizer_path = _AUDIO_TOKENIZER_FALLBACK_REPO
 
                 # higgs-audio-v2-tokenizer does not support MPS (output channels > 65536)
                 tokenizer_device = (
                     "cpu" if str(model.device).startswith("mps") else model.device
                 )
-                model.audio_tokenizer = HiggsAudioV2TokenizerModel.from_pretrained(
-                    audio_tokenizer_path, device_map=tokenizer_device
-                )
-                model.feature_extractor = AutoFeatureExtractor.from_pretrained(
-                    audio_tokenizer_path
-                )
+                try:
+                    model.audio_tokenizer = _audio_tokenizer_cls().from_pretrained(
+                        audio_tokenizer_path, device_map=tokenizer_device
+                    )
+                    model.feature_extractor = AutoFeatureExtractor.from_pretrained(
+                        audio_tokenizer_path
+                    )
+                except Exception as exc:
+                    if audio_tokenizer_path != _AUDIO_TOKENIZER_FALLBACK_REPO:
+                        raise
+                    raise OmniVoiceModelAssetError(
+                        _AUDIO_TOKENIZER_FALLBACK_REPO
+                    ) from exc
 
                 model.sampling_rate = model.feature_extractor.sampling_rate
 
@@ -295,7 +431,13 @@ class OmniVoice(PreTrainedModel):
                 if load_asr:
                     model.load_asr_model(model_name=asr_model_name)
         finally:
-            logging.disable(_prev_disable)
+            for _lg, _lvl in _prev_levels:
+                _lg.setLevel(_lvl)
+            # Restore TQDM_DISABLE state
+            if _prev_tqdm is None:
+                os.environ.pop("TQDM_DISABLE", None)
+            else:
+                os.environ["TQDM_DISABLE"] = _prev_tqdm
 
         return model
 
@@ -638,29 +780,88 @@ class OmniVoice(PreTrainedModel):
             ref_wav = waveform
 
         ref_rms = torch.sqrt(torch.mean(torch.square(ref_wav))).item()
+        # #1188: fail fast — and actionably — when the clip has no audio at
+        # all (empty / digitally silent / NaN samples). Everything quieter
+        # than the trim thresholds but real is recovered below, so this is
+        # the only remaining hard failure for a reference clip.
+        validate_clone_reference(ref_wav, ref_rms)
+        input_gain = 1.0
         if 0 < ref_rms < 0.1:
-            ref_wav = ref_wav * 0.1 / ref_rms
+            input_gain = 0.1 / ref_rms
+            ref_wav = ref_wav * input_gain
+
+        ref_duration = ref_wav.size(-1) / self.sampling_rate
+        if ref_text is not None and ref_duration > 20.0:
+            raise ValueError(
+                f"{CLONE_REF_TOO_LONG_MARKER} Reference audio is "
+                f"{ref_duration:.1f} seconds long; supplied transcripts support "
+                "at most 20 seconds. Trim both the audio and transcript to the "
+                "same 3-10 second passage, or omit the transcript so VoiceStudio "
+                "can trim and transcribe the clip automatically."
+            )
+        if ref_text is None and ref_duration > 15.0:
+            # Transcript-free automatic selection examines every passage, but
+            # caps the work at five bounded ASR calls. Longer references need
+            # an explicit user-selected passage rather than a lossy sampling
+            # policy that could silently miss speech between fixed windows.
+            max_samples = int(15.0 * self.sampling_rate)
+            max_auto_samples = 5 * max_samples
+            if ref_wav.size(-1) > max_auto_samples:
+                raise ValueError(
+                    f"{CLONE_REF_TOO_LONG_MARKER} Reference audio is "
+                    f"{ref_duration:.1f} seconds long; automatic transcript-free "
+                    "selection supports at most 75 seconds. Trim the audio to a "
+                    "3-10 second speech passage, or supply a matching transcript."
+                )
+
+            original_power = ref_wav.abs().amax(dim=0).square()
+            activity_cap = max(float(original_power.mean()) * 100.0, 1e-10)
+
+            def activity_score(audio):
+                power = audio.abs().amax(dim=0).square().clamp_max(activity_cap)
+                return float(power.double().sum())
+
+            if self._asr_pipe is None:
+                logger.info("ASR model not loaded yet, loading on-the-fly ...")
+                self.load_asr_model()
+            candidates = list(ref_wav.split(max_samples, dim=-1))
+
+            def speech_score(text):
+                return len(re.sub(r"[^\w]+", "", text or "", flags=re.UNICODE))
+
+            transcribed = [
+                (self.transcribe((candidate, self.sampling_rate)), candidate)
+                for candidate in candidates
+            ]
+            ref_text, ref_wav = max(
+                transcribed,
+                key=lambda item: (speech_score(item[0]), activity_score(item[1])),
+            )
+            if speech_score(ref_text) == 0:
+                raise ValueError(
+                    f"{CLONE_REF_NO_SPEECH_MARKER} Automatic speech detection "
+                    "could not find spoken words in the reference. Trim it to a "
+                    "clear 3-10 second speech passage, or supply a matching transcript."
+                )
 
         if preprocess_prompt:
-            # Trim long reference audio (>20s) by splitting at the largest silence gap.
-            # Skip trimming when ref_text is user-provided, otherwise the
-            # trimmed audio will no longer match the full transcript.
-            if ref_text is None:
-                ref_wav = trim_long_audio(
-                    ref_wav, self.sampling_rate, trim_threshold=20.0
-                )
-            ref_wav = remove_silence(
+            # #1188: the fixed -50 dBFS silence threshold used to consume a
+            # quiet-but-real recording wholesale and dead-end with
+            # "Reference audio is empty after silence removal". The safe
+            # variant retries with gentler thresholds and, as a last resort,
+            # skips trimming — a quiet real clip must clone, not 400.
+            ref_wav = remove_silence_safe(
                 ref_wav,
                 self.sampling_rate,
                 mid_sil=200,
                 lead_sil=100,
                 trail_sil=200,
             )
-            if ref_wav.size(-1) == 0:
-                raise ValueError(
-                    "Reference audio is empty after silence removal. "
-                    "Try setting preprocess_prompt=False."
-                )
+
+        # Cropping and silence removal happen after the original validation.
+        # Re-check the actual aligned passage that ASR/tokenization will see.
+        prepared_rms = torch.sqrt(torch.mean(torch.square(ref_wav))).item()
+        validate_clone_reference(ref_wav, prepared_rms)
 
         ref_duration = ref_wav.size(-1) / self.sampling_rate
         if ref_duration > 20.0:
@@ -682,6 +883,9 @@ class OmniVoice(PreTrainedModel):
         chunk_size = self.audio_tokenizer.config.hop_length
         clip_size = int(ref_wav.size(-1) % chunk_size)
         ref_wav = ref_wav[:, :-clip_size] if clip_size > 0 else ref_wav
+        aligned_rms = torch.sqrt(torch.mean(torch.square(ref_wav))).item()
+        validate_clone_reference(ref_wav, aligned_rms)
+        selected_ref_rms = aligned_rms / input_gain
         ref_audio_tokens = self.audio_tokenizer.encode(
             ref_wav.unsqueeze(0).to(self.audio_tokenizer.device),
         ).audio_codes.squeeze(
@@ -694,7 +898,7 @@ class OmniVoice(PreTrainedModel):
         return VoiceClonePrompt(
             ref_audio_tokens=ref_audio_tokens,
             ref_text=ref_text,
-            ref_rms=ref_rms,
+            ref_rms=selected_ref_rms,
         )
 
     def _decode_and_post_process(
@@ -750,7 +954,12 @@ class OmniVoice(PreTrainedModel):
             Processed audio tensor of shape (1, T).
         """
         if postprocess_output:
-            generated_audio = remove_silence(
+            # #1188 (same class as the reference-clip bug): quiet generated
+            # audio below the -50 dBFS silence threshold would be removed
+            # wholesale here, producing an empty/near-empty WAV that fails
+            # downstream decoding. The safe variant degrades to no trimming
+            # instead of destroying the take.
+            generated_audio = remove_silence_safe(
                 generated_audio,
                 self.sampling_rate,
                 mid_sil=500,
@@ -1401,7 +1610,11 @@ def _resolve_instruct(
 
     # Split on both half-width and full-width commas
     raw_items = re.split(r"\s*[,，]\s*", instruct_str)
-    raw_items = [x for x in raw_items if x]
+    # Tolerate the "[object Object]" sentinel a buggy frontend build could have
+    # persisted into voice_profiles.instruct (#550 et al): drop it instead of
+    # 400-ing the whole generation. The 0006 migration heals stored values; this
+    # guards any that slip through (e.g. generation_history rows).
+    raw_items = [x for x in raw_items if x and x.strip().lower() != "[object object]"]
 
     # Validate each item
     unknown = []

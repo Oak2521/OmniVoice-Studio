@@ -26,6 +26,21 @@ class SystemInfoResponse(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     app_version: str = ""
+    # Effective compute-time budgets (seconds) for one synthesis job — the
+    # values services/model_manager.py's GPU_JOB_TIMEOUT_S / CPU_JOB_TIMEOUT_S
+    # captured at backend import time (#1787). A value just saved via
+    # /system/set-env is NOT reflected here until the next restart.
+    generate_timeout_s: float = 300.0
+    cpu_generate_timeout_s: float = 600.0
+    # True when an external env var (shell, `.env`, Docker, …) is currently
+    # shadowing a prefs.json save for this key — see core.prefs.is_env_shadowed.
+    generate_timeout_shadowed: bool = False
+    cpu_generate_timeout_shadowed: bool = False
+    # #1770: the desktop attach handshake's code fingerprint — whatever
+    # Tauri set OMNIVOICE_BUILD_FINGERPRINT to when it spawned this process,
+    # echoed back verbatim. Blank when unset (dev mode, a manually started
+    # backend). See frontend/src-tauri/src/backend.rs::code_fingerprint_is_current.
+    code_fingerprint: str = ""
     data_dir: str
     outputs_dir: str
     crash_log_path: str
@@ -34,10 +49,19 @@ class SystemInfoResponse(BaseModel):
     asr_model: str = "unknown"
     translate_provider: str = "unknown"
     has_hf_token: bool = False
+    # Xet fast-download backend state (FDL-03): {xet_enabled, xet_version, high_performance}
+    fast_download: dict | None = None
     device: str = "cpu"
     python: str = ""
     platform: str = ""
     arch: str = ""
+    os_version: str = ""
+    cpu_model: str = ""
+    cpu_count: int = 0
+    ram_total_gb: float = 0.0
+    gpu_name: str = ""
+    vram_total_gb: float = 0.0
+    disk_free_gb: float = 0.0
     error: str | None = None
     ffmpeg_ok: bool = False
     ffmpeg_path: str = ""
@@ -120,8 +144,30 @@ class DeviceInfo(BaseModel):
     gpu_available: bool = False
     gpu_driver: str | None = None
     gpu_device_name: str | None = None
+    # From the canonical device probe (core.device_caps) — distinguishes ROCm
+    # from CUDA, unlike the legacy nvidia-smi-based gpu_vendor/gpu_backend.
+    gpu_family: str = "cpu"
+    vram_gb: float = 0.0
     ram_gb: float = 0.0
     disk_free_gb: float = 0.0
+
+
+class GpuRouting(BaseModel):
+    """Routing verdict for the active TTS engine on THIS host (#21).
+
+    Distinct from the per-engine `routing_*` keys in `/engines`: this is the
+    single verdict for the *currently-selected* engine, surfaced in preflight +
+    diagnose so the user hears about a CPU fallback / unavailable GPU before a
+    slow or failed synth — no silent CPU fallback.
+    """
+    model_config = ConfigDict(extra="allow")
+
+    engine: str | None = None            # active TTS engine id
+    effective_device: str | None = None  # device it will actually use here
+    routing_status: str | None = None    # accelerated|cpu_fallback|cpu_only|unavailable|none
+    routing_reason: str | None = None    # scrubbed; null when none
+    host_family: str = "cpu"             # detect_host_caps().family
+    vram_gb: float = 0.0
 
 
 class PreflightResponse(BaseModel):
@@ -130,6 +176,14 @@ class PreflightResponse(BaseModel):
     has_warnings: bool = False
     checks: list[PreflightCheck] = Field(default_factory=list)
     device: DeviceInfo
+    # Explicit field (PreflightResponse has no extra="allow") so the verdict
+    # survives serialization instead of being silently dropped.
+    gpu_routing: GpuRouting | None = None
+    # Media-engine verdict (ffmpeg/ffprobe) — NOT a check row: an internal
+    # dependency the app provisions for itself. Shape: {ready, acquire:
+    # {state, progress, error}}. The wizard renders a quiet progress line /
+    # failure card from it instead of "install ffmpeg" system requirements.
+    media_tools: dict | None = None
 
 
 class InstallModelRequest(BaseModel):

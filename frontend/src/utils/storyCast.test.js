@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { nextCastColor, effectiveProfile, castMember, CAST_COLORS } from './storyCast';
+import {
+  nextCastColor,
+  effectiveProfile,
+  effectiveSpeed,
+  castMember,
+  CAST_COLORS,
+} from './storyCast';
 
 describe('nextCastColor', () => {
   it('returns the first unused palette color', () => {
@@ -24,6 +30,24 @@ describe('effectiveProfile', () => {
   });
   it('returns null when neither is set', () => {
     expect(effectiveProfile({ character: 'owl', profileId: null }, cast)).toBeNull();
+  });
+});
+
+describe('effectiveSpeed', () => {
+  it('prefers a per-line speed override over the global', () => {
+    expect(effectiveSpeed({ speed: 1.25 }, 0.7)).toBe(1.25);
+  });
+  it('applies the global speed when the track has none (#508)', () => {
+    // Regression: preview + stem export must follow the global, not 1.0.
+    expect(effectiveSpeed({ speed: null }, 0.7)).toBe(0.7);
+    expect(effectiveSpeed({}, 0.7)).toBe(0.7);
+  });
+  it('treats a global of 1 as at-rest → null (engine default)', () => {
+    expect(effectiveSpeed({ speed: null }, 1)).toBeNull();
+  });
+  it('returns null when neither override nor a non-default global is set', () => {
+    expect(effectiveSpeed({ speed: null }, null)).toBeNull();
+    expect(effectiveSpeed({}, undefined)).toBeNull();
   });
 });
 

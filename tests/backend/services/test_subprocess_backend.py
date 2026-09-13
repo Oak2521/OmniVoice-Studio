@@ -9,6 +9,7 @@ macOS, Linux, and Windows.
 """
 from __future__ import annotations
 
+import collections
 import io
 import os
 import struct
@@ -279,7 +280,7 @@ def test_op_allowlist_drops_unknown(monkeypatch):
 def test_op_allowlist_constant_shape():
     """PARENT_INBOUND_OPS must contain exactly the documented set."""
     assert PARENT_INBOUND_OPS == frozenset({
-        "ready", "pong", "audio", "progress", "error",
+        "ready", "pong", "audio", "segments", "progress", "error",
         "gpu_acquire", "gpu_release",
     })
     # Sentinel — common typo / accidental addition would fail this test.
@@ -337,3 +338,90 @@ def test_no_multiprocessing_imports():
 
 def test_max_frame_bytes_is_64mb():
     assert MAX_FRAME_BYTES == 64 * 1024 * 1024
+
+# ── a failed ready handshake names its cause (#2026) ──────────────────────
+
+
+def _spawn_expecting_failure(backend) -> str:
+    with backend._lock:
+        with pytest.raises(RuntimeError) as err:
+            backend._spawn()
+    return str(err.value)
+
+
+def test_an_early_exit_names_its_exit_code_and_stderr(monkeypatch, echo_backend):
+    monkeypatch.setenv("OMNIVOICE_ECHO_TEST_MODE", "1")
+    monkeypatch.setenv("OMNIVOICE_ECHO_EXIT_BEFORE_READY", "3")
+    msg = _spawn_expecting_failure(echo_backend)
+    assert "did not signal ready: it exited with code 3 before signalling ready" in msg
+    assert "exiting before ready on purpose" in msg
+    assert "None" not in msg
+
+
+def test_a_deadline_kill_says_it_was_the_deadline(monkeypatch, echo_backend):
+    monkeypatch.setenv("OMNIVOICE_ECHO_TEST_MODE", "1")
+    monkeypatch.setenv("OMNIVOICE_ECHO_STALL_BEFORE_READY", "1")
+    echo_backend.spawn_ready_timeout_s = 1.0
+    msg = _spawn_expecting_failure(echo_backend)
+    assert "no ready frame within 1s, so it was stopped" in msg
+    assert "stalling before ready on purpose" in msg
+    assert "exited with code" not in msg
+
+
+def test_a_wrong_first_frame_is_a_protocol_mismatch(monkeypatch, echo_backend):
+    monkeypatch.setenv("OMNIVOICE_ECHO_TEST_MODE", "1")
+    monkeypatch.setenv("OMNIVOICE_ECHO_WRONG_READY", "1")
+    msg = _spawn_expecting_failure(echo_backend)
+    assert "it sent op='pong' instead of 'ready'" in msg
+
+
+def test_each_spawn_quotes_only_its_own_stderr(monkeypatch, echo_backend):
+    monkeypatch.setenv("OMNIVOICE_ECHO_TEST_MODE", "1")
+    monkeypatch.setenv("OMNIVOICE_ECHO_EXIT_BEFORE_READY", "3")
+    _spawn_expecting_failure(echo_backend)
+    first = echo_backend._stderr_tail
+    monkeypatch.setenv("OMNIVOICE_ECHO_EXIT_BEFORE_READY", "4")
+    msg = _spawn_expecting_failure(echo_backend)
+    assert "exited with code 4" in msg
+    # The first process's drain, still finishing, writes to its own buffer.
+    first.append("a late line from the previous process")
+    assert echo_backend._stderr_tail is not first
+    assert "late line" not in echo_backend._stderr_tail_text()
+
+
+def test_an_error_frame_before_ready_is_quoted_and_scrubbed(monkeypatch, echo_backend):
+    monkeypatch.setenv("OMNIVOICE_ECHO_TEST_MODE", "1")
+    monkeypatch.setenv(
+        "OMNIVOICE_ECHO_ERROR_BEFORE_READY", "import failed in C:\\Users\\alice\\engine"
+    )
+    msg = _spawn_expecting_failure(echo_backend)
+    assert "it reported an error instead: import failed in" in msg
+    assert "alice" not in msg
+
+
+class _LinesProc:
+    def __init__(self, *lines: bytes):
+        self.stderr = io.BytesIO(b"".join(line + b"\n" for line in lines))
+
+
+def test_a_late_drain_reads_its_own_process_not_the_replacement(echo_backend):
+    old, new = _LinesProc(b"old process line"), _LinesProc(b"new process line")
+    old_tail = collections.deque(maxlen=12)
+    # The replacement is already published when the old drain finally runs.
+    echo_backend._proc = new
+    try:
+        echo_backend._drain_stderr(old, old_tail)
+    finally:
+        echo_backend._proc = None
+    assert list(old_tail) == ["old process line"]
+    assert new.stderr.read() == b"new process line\n"  # untouched
+
+
+def test_the_quoted_stderr_is_scrubbed_and_bounded(echo_backend):
+    echo_backend._stderr_tail.clear()
+    echo_backend._stderr_tail.append("loading C:\\Users\\alice\\venv hf_" + "a" * 34)
+    for i in range(40):
+        echo_backend._stderr_tail.append("x" * 60 + str(i))
+    text = echo_backend._stderr_tail_text()
+    assert "alice" not in text and "hf_aaaa" not in text
+    assert len(text) <= 801

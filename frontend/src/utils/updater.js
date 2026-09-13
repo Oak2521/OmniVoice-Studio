@@ -16,6 +16,7 @@
  * Both no-op outside a packaged Tauri build.
  */
 import { normalizeChannel } from './updateChannel';
+import { flushApplicationPersistence } from './persistenceLifecycle';
 
 export function isTauri() {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -50,8 +51,25 @@ export async function checkForUpdate(store) {
     const { invoke } = await import('@tauri-apps/api/core');
     const channel = await currentChannel();
     const update = await invoke('check_update', { channel });
-    if (update) store.setUpdateAvailable(update.version, update.notes || null);
-    else store.setUpdateIdle();
+    if (update) {
+      store.setUpdateAvailable(update.version, update.notes || null);
+      // Announce it where the user is looking. The footer's version dot stays
+      // as the persistent, non-intrusive marker; this is the one-time nudge.
+      // Lazy so the toast never loads in a browser/dev build that can't update.
+      //
+      // Caught separately: a failed chunk load must not fall through to the
+      // outer catch, which calls setUpdateIdle() and would erase the update we
+      // just found. The announcement is the optional part — the available
+      // state (footer dot, Settings → Updates) is what has to survive.
+      try {
+        const { showUpdateToast } = await import('../components/UpdateToast');
+        showUpdateToast(update.version);
+      } catch (e) {
+        console.debug('Update toast failed to load (non-fatal):', e);
+      }
+    } else {
+      store.setUpdateIdle();
+    }
   } catch (e) {
     // Endpoint 404s until the first signed release on a channel — non-fatal.
     console.debug('Update check failed (non-fatal):', e);
@@ -76,6 +94,13 @@ export async function installUpdate(store) {
     });
     await invoke('install_update', { channel });
     store.setUpdateReady();
+    try {
+      await flushApplicationPersistence();
+    } catch (error) {
+      // The update is already installed. Persistence failure must not rewrite
+      // that successful state as an install error or strand the relaunch.
+      console.warn('[persistence] installed-update flush failed', error);
+    }
     await relaunch();
   } catch (e) {
     console.warn('Update install failed:', e);

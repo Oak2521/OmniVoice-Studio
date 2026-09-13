@@ -21,13 +21,16 @@ import asyncio
 import json
 import logging
 import os
+import re
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from services import director, speech_rate, incremental
 from services.ffmpeg_utils import find_ffprobe, spawn_subprocess
+from api.dependencies import require_native_access
+from core.path_security import UnsafePath, resolve_within
 
 logger = logging.getLogger("omnivoice.tools")
 router = APIRouter()
@@ -40,7 +43,7 @@ class ProbeReq(BaseModel):
     path: str
 
 
-@router.post("/tools/probe")
+@router.post("/tools/probe", dependencies=[Depends(require_native_access)])
 async def probe(req: ProbeReq):
     target = os.path.realpath(os.path.expanduser(req.path))
     if not os.path.exists(target):
@@ -77,6 +80,15 @@ async def probe(req: ProbeReq):
 class IncrementalReq(BaseModel):
     segments: list[dict]
     stored_hashes: Optional[dict[str, str]] = None
+    # P1.3 — the ACTIVE track's language code. When set, fingerprints are
+    # scoped to that language (pass that language's stored hashes alongside);
+    # omitted → legacy language-agnostic hashing, kept for old callers.
+    lang: Optional[str] = None
+    # Voice-identity mode the client will generate with (DubRequest.voice_match).
+    # Only "consistent" changes the hash (per_line/omitted == legacy), so
+    # flipping the Voice-match toggle marks every segment stale — the audio
+    # really would come out with a different reference (#281 class).
+    voice_match: Optional[str] = None
 
 
 @router.post("/tools/incremental")
@@ -84,6 +96,8 @@ def plan_incremental(req: IncrementalReq):
     return incremental.plan_incremental(
         req.segments,
         stored_hashes=req.stored_hashes or {},
+        track_lang=req.lang,
+        voice_match=req.voice_match,
     )
 
 
@@ -163,18 +177,26 @@ async def analyse_video_context(job_id: str):
     from core.config import DUB_DIR
     from services.video_context import analyse_video
 
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", job_id or ""):
+        raise HTTPException(status_code=400, detail="Invalid job id")
+    try:
+        job_dir = resolve_within(DUB_DIR, job_id)
+    except UnsafePath as exc:
+        raise HTTPException(status_code=400, detail="Invalid job id") from exc
     job = _get_job(job_id)
     if not job:
-        from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Job not found")
 
-    video_path = os.path.join(DUB_DIR, job_id, "source.mp4")
-    if not os.path.exists(video_path):
-        video_path = job.get("video_path", "")
+    video_path = resolve_within(DUB_DIR, job_dir / "source.mp4")
+    if not video_path.is_file():
+        try:
+            video_path = resolve_within(DUB_DIR, job.get("video_path", ""))
+        except UnsafePath:
+            return {"error": "Source video not found", "segments": {}}
 
-    if not video_path or not os.path.exists(video_path):
+    if not video_path.is_file():
         return {"error": "Source video not found", "segments": {}}
 
     segments = job.get("segments") or []
-    ctx = await analyse_video(video_path, segments)
+    ctx = await analyse_video(str(video_path), segments)
     return ctx.to_dict()

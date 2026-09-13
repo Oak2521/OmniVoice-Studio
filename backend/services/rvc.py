@@ -76,8 +76,8 @@ def _get_engine():
             protect=cfg["protect"],
         )
         return _rvc_engine
-    except Exception as e:
-        logger.error("Failed to initialise RVC engine: %s", e)
+    except Exception:
+        logger.exception("Failed to initialise RVC engine")
         return None
 
 
@@ -95,6 +95,6 @@ def apply_rvc(wav_path: str) -> str:
     try:
         engine.infer_file(wav_path, wav_path)
         return wav_path
-    except Exception as e:
-        logger.error("RVC inference failed for %s: %s", wav_path, e)
+    except Exception:
+        logger.exception("RVC inference failed for %s", wav_path)
         return wav_path

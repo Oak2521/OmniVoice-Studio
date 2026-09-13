@@ -1,9 +1,12 @@
 """
 Audio DSP pipeline — broadcast-grade mastering + configurable effects chain.
 
-The default `apply_mastering()` is the same chain shipped since v0.1.0
-(highpass + compressor + light reverb). The new `apply_effects_chain()`
-lets callers build custom pipelines from a list of named effects.
+`apply_mastering()` is the shared pre-stage that runs before the user's
+effect preset: highpass + gentle compression only (see `MASTERING_CHAIN`).
+Reverb is deliberately NOT part of it — it is preset-declared only (e.g.
+cinematic, warm); a hidden reverb here used to bake echo into every non-raw
+synthesis, which field reports flagged. `apply_effects_chain()` lets callers
+build custom pipelines from a list of named effects.
 
 All effects use Spotify's `pedalboard` library. When pedalboard isn't
 installed, every function degrades gracefully (returns audio unmodified).
@@ -97,24 +100,26 @@ def get_effect_chain(preset_id: str) -> list[dict]:
 
 # ── Core DSP functions ──────────────────────────────────────────────────
 
+#: Shared pre-preset mastering stage: highpass + gentle compression ONLY.
+#: Reverb must never live here — a hidden Reverb in this chain baked echo
+#: into every non-raw synthesis regardless of the chosen preset (field
+#: reports of echoey voices; the podcast preset even promises "no reverb").
+#: Reverb is preset-declared only (see EFFECT_PRESETS: cinematic, warm).
+MASTERING_CHAIN = [
+    {"type": "highpass", "cutoff_hz": 60},
+    {"type": "compressor", "threshold_db": -15, "ratio": 1.5, "attack_ms": 2.0, "release_ms": 100},
+]
+
 
 def apply_mastering(audio_tensor, sample_rate=24000):
-    """Applies professional Broadcast-grade DSP (EQ, Compressor, light Reverb) to the clone voice."""
+    """Applies the broadcast pre-stage (highpass + gentle compression) to the clone voice.
+
+    Reverb is intentionally absent — only user-chosen effect presets declare
+    it. Degrades gracefully: pedalboard missing or any DSP error returns the
+    input unmodified.
+    """
     try:
-        from pedalboard import Pedalboard, Compressor, Reverb, HighpassFilter
-        import numpy as np
-        board = Pedalboard([
-            HighpassFilter(cutoff_frequency_hz=60),
-            Compressor(threshold_db=-15, ratio=1.5, attack_ms=2.0, release_ms=100),
-            Reverb(room_size=0.10, wet_level=0.08, dry_level=0.95)
-        ])
-        audio_np = audio_tensor.cpu().numpy()
-        if audio_np.ndim == 1:
-            audio_np = audio_np[np.newaxis, :]
-        effected = board(audio_np, sample_rate, reset=False)
-        return torch.from_numpy(effected).to(audio_tensor.device)
-    except ImportError:
-        return audio_tensor # Fail gracefully if pedalboard isn't installed
+        return apply_effects_chain(audio_tensor, sample_rate, MASTERING_CHAIN)
     except Exception as e:
         logger.warning("Mastering DSP Error: %s", e)
         return audio_tensor
@@ -140,6 +145,45 @@ def normalize_audio(audio_tensor, target_dBFS=-2.0):
         target_amp = 10 ** (target_dBFS / 20.0)
         audio_tensor = audio_tensor * (target_amp / max_val)
     return audio_tensor
+
+
+def trim_trailing_silence(
+    audio_tensor: torch.Tensor,
+    sample_rate: int,
+    keep_tail_s: float = 0.3,
+) -> torch.Tensor:
+    """Trim trailing near-silence from a generated clip, keeping a short
+    natural tail of ``keep_tail_s`` seconds after the last voiced sample.
+
+    Amplitude-based SILENCE trim only — no content analysis of any kind.
+    Uses the same -50 dBFS silence floor as :func:`normalize_audio`: the last
+    sample above that floor marks the end of speech, and everything more than
+    ``keep_tail_s`` past it is dropped.
+
+    Guaranteed no-op cases (input returned as-is, same object):
+      • the trailing quiet span is already ≤ ``keep_tail_s`` (clean output);
+      • the entire clip sits below the floor (dead render — downstream
+        dead-render guards own that case, we must not shrink their evidence);
+      • empty input.
+
+    Accepts ``(n,)`` or ``(channels, n)`` tensors; the returned tensor keeps
+    the input's shape convention.
+    """
+    if audio_tensor.numel() == 0:
+        return audio_tensor
+    # -50 dBFS ≈ 0.00316 linear — matches normalize_audio's silence floor.
+    floor = 10 ** (-50.0 / 20.0)
+    envelope = torch.abs(audio_tensor)
+    if envelope.ndim > 1:
+        envelope = envelope.amax(dim=tuple(range(envelope.ndim - 1)))
+    voiced = torch.nonzero(envelope > floor)
+    if voiced.numel() == 0:
+        return audio_tensor
+    last_voiced = int(voiced[-1].item())
+    end = last_voiced + 1 + int(keep_tail_s * sample_rate)
+    if end >= audio_tensor.shape[-1]:
+        return audio_tensor
+    return audio_tensor[..., :end]
 
 
 def apply_effects_chain(audio_tensor, sample_rate: int, chain: list[dict]) -> torch.Tensor:

@@ -25,9 +25,17 @@ from dataclasses import dataclass
 
 # Captures: HH MM SS sep(`,` or `.`) ms (1-3 digits)
 _TS = r"(\d{1,2}):([0-5]?\d):([0-5]?\d)[,.](\d{1,3})"
+# Horizontal whitespace only — NEVER plain `\s`, which matches newlines.
+# A timing line lives on ONE line, so `\s*` bought nothing but catastrophic
+# backtracking: under re.MULTILINE the engine restarts at every line start,
+# and `^\s*` there happily consumes every remaining blank line before
+# failing on the first digit, making the scan quadratic in the input size.
+# A .srt of blank lines (a mis-saved export, a paste gone wrong) pinned the
+# parse for hours — 20k blank lines already took 1.7s, 2 MB never returned.
+_H = r"[^\S\n]*"
 # Whole timing line: `00:00:01,000 --> 00:00:04,500` plus optional trailing
 # cue style hints (X1: Y1: ... ) we just throw away.
-_TIMING_RE = re.compile(rf"^\s*{_TS}\s*-->\s*{_TS}.*$", re.MULTILINE)
+_TIMING_RE = re.compile(rf"^{_H}{_TS}{_H}-->{_H}{_TS}.*$", re.MULTILINE)
 
 
 def _ts_to_seconds(h: str, m: str, s: str, ms: str) -> float:

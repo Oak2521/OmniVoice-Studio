@@ -7,31 +7,22 @@ old silence-only guard missed it (the buzz is loud, not silent) so the garbage
 was cached and served.
 
 These tests cover the fix *without the 5 GB model / a GPU*: they drive the pure
-``_spectral_flatness`` / ``_is_unusable_audio`` helpers with synthetic signals,
-and assert the render constants didn't regress. The real end-to-end render is
-verified manually (spectral flatness back in the speech range + Whisper ASR).
+``_spectral_flatness`` / ``_is_unusable_audio`` helpers with synthetic tones and
+tracked speech demo renders, and assert the render constants did not regress.
 """
 from __future__ import annotations
 
 import math
-import os
-import sys
-import tempfile
-import types
 from pathlib import Path
+
+import soundfile as sf
 
 import pytest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-
-# Stub core.config before the router imports OUTPUTS_DIR / VOICES_DIR from it.
-_TMP = tempfile.mkdtemp(prefix="omnivoice_preview_q_")
-_config = types.ModuleType("core.config")
-_config.DATA_DIR = _TMP
-_config.VOICES_DIR = str(Path(_TMP) / "voices")
-_config.OUTPUTS_DIR = str(Path(_TMP) / "outputs")
-sys.modules["core.config"] = _config
-
+# conftest.py puts `backend/` on sys.path and points OMNIVOICE_DATA_DIR at a
+# throwaway tmpdir before the router imports OUTPUTS_DIR / VOICES_DIR from
+# the REAL core.config (the old sys.modules stub leaked at collection time
+# and broke later importers in mixed runs — see conftest.py).
 torch = pytest.importorskip("torch")  # noqa: E402
 
 from api.routers import archetypes as arch  # noqa: E402
@@ -48,6 +39,13 @@ def _pure_tone(hz: float = 220.0) -> "torch.Tensor":
 def _white_noise() -> "torch.Tensor":
     g = torch.Generator().manual_seed(0)
     return 0.5 * (torch.rand(N, generator=g) * 2 - 1)
+
+
+def _two_tone_buzz() -> "torch.Tensor":
+    """Two inharmonic partials — the other shape a collapsed render takes."""
+    t = torch.arange(N, dtype=torch.float32) / SR
+    s = torch.sin(2 * math.pi * 180.0 * t) + 0.6 * torch.sin(2 * math.pi * 361.0 * t)
+    return 0.8 * s / s.abs().max()
 
 
 def _speech_like() -> "torch.Tensor":
@@ -94,6 +92,71 @@ def test_silence_is_unusable():
 
 def test_speech_like_is_usable():
     assert arch._is_unusable_audio(_speech_like()) is False
+
+
+# ── Threshold stays between the two things it has to separate ───────────────
+# Synthetic broadband speech has much higher flatness than real voiced audio.
+# Measure both sides of the threshold against actual inputs, including the
+# existing demo renders that the old thresholds rejected.
+
+
+def test_tonal_ceiling_is_measured_not_assumed():
+    """Derive the tonal side of the margin instead of trusting a literal.
+
+    A bare constant would keep passing if `_spectral_flatness` stopped scoring
+    tones near zero, so measure the degenerate signals here and require the
+    threshold to clear the worst of them tenfold.
+    """
+    tones = [
+        arch._spectral_flatness(_pure_tone(80.0)),
+        arch._spectral_flatness(_pure_tone(220.0)),
+        arch._spectral_flatness(_two_tone_buzz()),
+    ]
+    assert all(t is not None for t in tones)
+    assert max(tones) * 10 < arch._DEGENERATE_FLATNESS
+
+
+_SAMPLES = Path(__file__).resolve().parents[1] / "assets" / "samples"
+_SPEECH_FIXTURES = [
+    "demo_voice.wav",
+    "demo_clone_output.wav",
+    *[f"voice_design/demo_voice_design_{name}.wav" for name in (
+        "audiobook_uk_narrator", "aussie_podcaster", "bedtime_storyteller",
+        "gravelly_villain", "indian_support_agent", "mandarin_sichuan", "us_news_anchor",
+    )],
+    *[f"dictation/{name}.wav" for name in (
+        "en_conversational", "en_technical", "fr_reservation",
+    )],
+    *[f"demo/dubbing/{name}.src.wav" for name in (
+        "source", "dubbed_es", "dubbed_fr", "dubbed_ja", "dubbed_zh",
+    )],
+]
+
+
+@pytest.mark.parametrize("fixture", _SPEECH_FIXTURES)
+def test_real_shipped_speech_clears_quality_floor(fixture):
+    # These are existing tracked demo renders, not synthesized stand-ins or
+    # asserted measurements. Loading PCM needs neither a model nor a network.
+    audio, _sample_rate = sf.read(_SAMPLES / fixture, dtype="float32", always_2d=True)
+    speech = torch.from_numpy(audio.T)
+    flatness = arch._spectral_flatness(speech)
+    assert flatness is not None
+    assert flatness > arch._DEGENERATE_FLATNESS * 10
+    assert arch._is_unusable_audio(speech) is False
+
+
+def test_flatness_is_not_clip_length_dependent():
+    """Repeating a signal must not change what it measures.
+
+    The whole-clip FFT this replaced failed exactly here: its frequency
+    resolution grew with duration, so the same audio measured 0.0229 at 3 s and
+    ~0 at 12 s (100% drift). Framed, the drift is under 0.1%.
+    """
+    short = _speech_like()
+    long = torch.cat([short] * 4)
+    a, b = arch._spectral_flatness(short), arch._spectral_flatness(long)
+    assert a is not None and b is not None
+    assert abs(a - b) / a < 0.02
 
 
 # ── Constants didn't regress ────────────────────────────────────────────────

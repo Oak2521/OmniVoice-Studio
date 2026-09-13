@@ -35,8 +35,8 @@ describe('errorDocsMap', () => {
     expect(openExternal).toHaveBeenCalledWith(DEFAULT_DOCS);
   });
 
-  // Sentinel test — locks the 5-class taxonomy in lockstep with the
-  // Python map (backend/core/error_docs_map.py). Adding a 6th class is
+  // Sentinel test — locks the taxonomy in step with the Python map
+  // (backend/core/error_docs_map.py). Adding a class is
   // a contract change; update both sides + this list.
   it('keys match the locked taxonomy (mirror of Python map)', () => {
     expect(Object.keys(ERROR_DOCS).sort()).toEqual([...ERROR_CLASS_KEYS].sort());
@@ -46,13 +46,20 @@ describe('errorDocsMap', () => {
         'GATEKEEPER_QUARANTINE',
         'HF_AUTH_FAILED',
         'PKG_RESOURCES_MISSING',
+        'POCKETTTS_GATED_WEIGHTS',
         'PYANNOTE_LICENSE_REQUIRED',
       ].sort(),
     );
   });
 
+  it('classifyError maps PocketTTS access failures to its setup guide', () => {
+    expect(classifyError(new Error('PocketTTS gated model: share your contact information'))).toBe(
+      'POCKETTTS_GATED_WEIGHTS',
+    );
+  });
+
   it('every URL resolves under the project repo blob', () => {
-    const base = 'https://github.com/debpalash/OmniVoice-Studio/blob/main';
+    const base = 'https://github.com/debpalash/VoiceStudio/blob/main';
     for (const [key, url] of Object.entries(ERROR_DOCS)) {
       expect(url.startsWith(base), `${key} not under ${base}: ${url}`).toBe(true);
     }
@@ -79,33 +86,25 @@ describe('errorDocsMap', () => {
     expect(classifyError(new Error('Speaker diarization model failed to load'))).toBe(
       'PYANNOTE_LICENSE_REQUIRED',
     );
-    expect(
-      classifyError(new Error('You must accept the user conditions for this model')),
-    ).toBe('PYANNOTE_LICENSE_REQUIRED');
+    expect(classifyError(new Error('You must accept the user conditions for this model'))).toBe(
+      'PYANNOTE_LICENSE_REQUIRED',
+    );
   });
 
   it('classifyError maps WebKit / white screen to APPIMAGE_WEBKIT_WHITESCREEN', () => {
     expect(classifyError(new Error('webkit compositing failed'))).toBe(
       'APPIMAGE_WEBKIT_WHITESCREEN',
     );
-    expect(classifyError(new Error('white screen on Fedora'))).toBe(
-      'APPIMAGE_WEBKIT_WHITESCREEN',
-    );
+    expect(classifyError(new Error('white screen on Fedora'))).toBe('APPIMAGE_WEBKIT_WHITESCREEN');
   });
 
   it('classifyError maps quarantine / Gatekeeper to GATEKEEPER_QUARANTINE', () => {
     expect(classifyError(new Error('com.apple.quarantine flag'))).toBe('GATEKEEPER_QUARANTINE');
-    expect(classifyError(new Error('Gatekeeper blocked the launch'))).toBe(
-      'GATEKEEPER_QUARANTINE',
-    );
+    expect(classifyError(new Error('Gatekeeper blocked the launch'))).toBe('GATEKEEPER_QUARANTINE');
     // Issue #72: macOS reports "app is damaged" in English and "已损坏" in
     // localized Chinese builds — both should land on the same docs page.
-    expect(classifyError(new Error('OmniVoice Studio is damaged'))).toBe(
-      'GATEKEEPER_QUARANTINE',
-    );
-    expect(classifyError(new Error('OmniVoice Studio已损坏，无法打开'))).toBe(
-      'GATEKEEPER_QUARANTINE',
-    );
+    expect(classifyError(new Error('VoiceStudio is damaged'))).toBe('GATEKEEPER_QUARANTINE');
+    expect(classifyError(new Error('VoiceStudio已损坏，无法打开'))).toBe('GATEKEEPER_QUARANTINE');
   });
 
   it('classifyError returns null on unknown messages', () => {

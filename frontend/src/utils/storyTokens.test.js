@@ -16,16 +16,23 @@ describe('parseStoryText', () => {
     ]);
   });
 
-  it('accepts pauses without trailing "s" and with integer seconds', () => {
-    const out = parseStoryText('A [pause 1] B [pause 2s] C', 'n');
-    expect(out.filter(e => e.type === 'pause')).toEqual([
-      { type: 'pause', seconds: 1 },
-      { type: 'pause', seconds: 2 },
+  it('treats a bare number as milliseconds (#27 canonical), "s" as seconds', () => {
+    // #27 convergence to the server dialect: a unitless number is MILLISECONDS
+    // ([pause 1] = 1ms = 0.001s), and "ms"/"s" units are honored. Previously the
+    // client read a bare number as seconds — now both ports agree it's ms.
+    const out = parseStoryText('A [pause 1] B [pause 2s] C [pause 500ms] D', 'n');
+    expect(out.filter((e) => e.type === 'pause')).toEqual([
+      { type: 'pause', seconds: 0.001 }, // 1ms
+      { type: 'pause', seconds: 2 }, // 2s
+      { type: 'pause', seconds: 0.5 }, // 500ms
     ]);
   });
 
   it('switches voice on a voice marker and carries it forward', () => {
-    const out = parseStoryText('Default [voice:char-0] switched [pause 0.3s] still switched', 'narrator');
+    const out = parseStoryText(
+      'Default [voice:char-0] switched [pause 0.3s] still switched',
+      'narrator',
+    );
     expect(out).toEqual([
       { type: 'chunk', text: 'Default', profileId: 'narrator' },
       { type: 'chunk', text: 'switched', profileId: 'char-0' },
@@ -45,12 +52,12 @@ describe('parseStoryText', () => {
   it('drops whitespace-only chunks between markers', () => {
     const out = parseStoryText('A   [pause 0.2s]   B', 'n');
     // Only the trimmed "A" and "B" survive; the spaces between aren't spoken.
-    expect(out.filter(e => e.type === 'chunk').map(e => e.text)).toEqual(['A', 'B']);
+    expect(out.filter((e) => e.type === 'chunk').map((e) => e.text)).toEqual(['A', 'B']);
   });
 
   it('ignores pauses with zero or negative seconds', () => {
     const out = parseStoryText('A [pause 0s] B', 'n');
-    expect(out.some(e => e.type === 'pause')).toBe(false);
+    expect(out.some((e) => e.type === 'pause')).toBe(false);
   });
 
   it('returns an empty list for empty input', () => {
@@ -59,10 +66,43 @@ describe('parseStoryText', () => {
   });
 });
 
+// §I — #27 dialect-widening cases (bare/ms pause, empty [voice:], NO-MATCH set)
+describe('parseStoryText — #27 canonical dialect', () => {
+  it('emits bare [pause] as 0.35s (was previously spoken)', () => {
+    expect(parseStoryText('a [pause] b')).toEqual([
+      { type: 'chunk', text: 'a', profileId: null },
+      { type: 'pause', seconds: 0.35 },
+      { type: 'chunk', text: 'b', profileId: null },
+    ]);
+  });
+
+  it('empty [voice:] reverts to the default profile (no longer spoken)', () => {
+    const out = parseStoryText('a [voice:p_x] b [voice:] c', 'p_def');
+    expect(out.map((e) => [e.profileId, e.text])).toEqual([
+      ['p_def', 'a'],
+      ['p_x', 'b'],
+      ['p_def', 'c'],
+    ]);
+  });
+
+  it('does not match NO-MATCH boundary pause forms (spoken literally)', () => {
+    for (const bad of ['[pause .5s]', '[pause -5s]', '[pause1s]', '[pausexyz]']) {
+      const out = parseStoryText(`x ${bad} y`);
+      expect(out.some((e) => e.type === 'pause')).toBe(false);
+      expect(out.map((e) => e.text || '').join(' ')).toContain('pause');
+    }
+  });
+});
+
 describe('hasStoryMarkers', () => {
   it('returns true when either token is present', () => {
     expect(hasStoryMarkers('A [pause 0.5s] B')).toBe(true);
     expect(hasStoryMarkers('[voice:char-0] hello')).toBe(true);
+  });
+  it('recognizes the #27-widened forms (bare/ms pause, empty voice)', () => {
+    expect(hasStoryMarkers('hi [pause] there')).toBe(true);
+    expect(hasStoryMarkers('hi [pause 500ms] there')).toBe(true);
+    expect(hasStoryMarkers('hi [voice:] there')).toBe(true);
   });
   it('returns false for plain prose', () => {
     expect(hasStoryMarkers('Just regular text.')).toBe(false);

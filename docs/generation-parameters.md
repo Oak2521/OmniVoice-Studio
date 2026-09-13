@@ -30,6 +30,8 @@ audio = model.generate(text="Hello world", generation_config=config)
 | `class_temperature` | float | 0.0 | Temperature for token sampling at each step. 0 = greedy (deterministic). Higher values increase randomness. |
 | `layer_penalty_factor` | float | 5.0 | Penalty applied to deeper codebook layers, encouraging earlier (lower) layers to unmask first. |
 
+> Using temperature (and seed pinning) to elicit expressive delivery — breaths, laughter, sighs — is covered in [expressive-speech.md](expressive-speech.md), including the tradeoffs.
+
 ## Duration & Speed
 
 These accept a single value applied to all items, or a per-item list (useful in batch mode):
@@ -55,6 +57,12 @@ Priority: `duration` > `speed`.
 |---|---|---|---|
 | `preprocess_prompt` | bool | True | Whether to apply preprocessing to the voice-clone prompt audio (remove long silences in reference audio, add punctuation in the end of reference text). |
 | `postprocess_output` | bool | True | Apply post-processing to generated audio (remove long silences). |
+
+> **Note — quiet recordings are safe.** Silence removal is adaptive: if trimming at the standard threshold would consume a quiet-but-real recording, progressively gentler thresholds are tried and, as a last resort, trimming is skipped — a quiet clip clones instead of erroring. Only a clip with genuinely no audio (empty or fully silent) is rejected, with guidance to re-record closer to the microphone.
+>
+> **Tip — reference-clip quality transfers.** Zero-shot cloning mirrors the acoustics of the reference clip, not just the voice: a clip recorded in an echoey room clones echoey. Record dry and close-mic for clean output. No effect preset adds reverb unless you choose one that declares it (Cinematic, Warm).
+
+For an in-app recording, choose the microphone and Auto, Mono, or Stereo in the Voice panel. While recording, the input meter confirms whether VoiceStudio is receiving a usable signal; monitoring is visual and never plays the microphone through the speakers.
 
 ## Long-Form Generation
 

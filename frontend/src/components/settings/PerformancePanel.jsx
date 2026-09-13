@@ -17,21 +17,18 @@
  */
 import React, { useCallback, useEffect, useState } from 'react';
 import { Cpu } from 'lucide-react';
+import { Trans, useTranslation } from 'react-i18next';
 import { apiJson, apiFetch } from '../../api/client';
-import { useAppStore } from '../../store';
-import './PerformancePanel.css';
+import { SettingsSection, SettingRow, SettingsToggle } from './primitives';
+import RestartBadge from './RestartBadge';
 
 export default function PerformancePanel() {
+  const { t } = useTranslation();
   const [enabled, setEnabled] = useState(false);
   const [platform, setPlatform] = useState(null);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(null);
-
-  // Header live-metrics toggle (default OFF). Persisted via the Zustand
-  // app store so it survives reload without a separate API round-trip.
-  const showHeaderLiveStats = useAppStore(s => s.showHeaderLiveStats);
-  const setShowHeaderLiveStats = useAppStore(s => s.setShowHeaderLiveStats);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -41,23 +38,22 @@ export default function PerformancePanel() {
       setEnabled(Boolean(data?.enabled));
       setPlatform(data?.platform ?? null);
     } catch (e) {
-      setError(e?.message || 'Failed to load performance settings');
+      setError(
+        e?.message ||
+          t('settings.perf_load_failed', { defaultValue: 'Failed to load performance settings' }),
+      );
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [t]);
 
   useEffect(() => {
     refresh();
   }, [refresh]);
 
   const isWindows = platform === 'win32';
-  const tooltip = isWindows
-    ? 'Sets TORCH_COMPILE_DISABLE=1 on engine subprocesses to dodge the Windows torch.compile OOM (#65).'
-    : 'This setting only affects Windows; on macOS/Linux torch.compile is not the OOM source.';
 
-  const onToggle = async (e) => {
-    const next = e.target.checked;
+  const onToggle = async (next) => {
     setSaving(true);
     setError(null);
     try {
@@ -69,7 +65,9 @@ export default function PerformancePanel() {
       const body = await res.json().catch(() => ({}));
       setEnabled(Boolean(body?.enabled ?? next));
     } catch (err) {
-      setError(err?.message || 'Failed to save setting');
+      setError(
+        err?.message || t('settings.perf_save_failed', { defaultValue: 'Failed to save setting' }),
+      );
       // Re-sync on failure so the UI doesn't show a stale state
       refresh();
     } finally {
@@ -77,65 +75,68 @@ export default function PerformancePanel() {
     }
   };
 
-  return (
-    <section className="perfpanel" aria-labelledby="perfpanel-heading">
-      <h3 id="perfpanel-heading" className="perfpanel__title">
-        <Cpu size={14} /> Performance
-      </h3>
+  const toggleLabel = t('settings.perf_torch_compile', {
+    defaultValue: 'Disable torch.compile (Windows)',
+  });
 
+  return (
+    <SettingsSection icon={Cpu} title={t('settings.perf_title', { defaultValue: 'Performance' })}>
       {error && (
         <div className="perfpanel__error" role="alert">
           {error}
         </div>
       )}
 
-      <label className="perfpanel__row" title={tooltip}>
-        <input
-          type="checkbox"
-          className="perfpanel__checkbox"
-          checked={enabled}
-          onChange={onToggle}
-          disabled={!isWindows || saving || loading}
-          data-testid="torch-compile-toggle"
-        />
-        <span className="perfpanel__label">Disable torch.compile (Windows)</span>
-        {!isWindows && (
-          <span className="perfpanel__badge">{platform === null ? '…' : 'not applicable'}</span>
-        )}
-      </label>
-
-      <p className="perfpanel__help">
-        Workaround for{' '}
-        <a
-          href="https://github.com/debpalash/OmniVoice-Studio/issues/65"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          #65
-        </a>{' '}
-        — Windows users may hit Triton / <code>torch.compile</code> OOM during
-        model load on GPUs with &lt;16 GB VRAM. Enabling this sets{' '}
-        <code>TORCH_COMPILE_DISABLE=1</code> on engine subprocesses, which
-        falls back to eager mode. macOS and Linux are unaffected.
-      </p>
-
-      <label className="perfpanel__row" title="Show RAM / CPU / VRAM live counters in the top bar.">
-        <input
-          type="checkbox"
-          className="perfpanel__checkbox"
-          checked={showHeaderLiveStats}
-          onChange={(e) => setShowHeaderLiveStats(e.target.checked)}
-          data-testid="header-live-stats-toggle"
-        />
-        <span className="perfpanel__label">Show live system metrics in header</span>
-      </label>
-
-      <p className="perfpanel__help">
-        Default off — the header keeps the model-status badge and Flush
-        button always visible because they're action-relevant, but RAM /
-        CPU / VRAM counters are noise on the welcome screen. Turn this on
-        if you want a live resource monitor in the top bar.
-      </p>
-    </section>
+      <SettingRow
+        title={
+          <>
+            {toggleLabel}
+            <RestartBadge />
+          </>
+        }
+        subtitle={
+          !isWindows
+            ? platform === null
+              ? '…'
+              : t('settings.perf_torch_compile_na', {
+                  defaultValue: 'Windows only — not needed on this platform',
+                })
+            : undefined
+        }
+        note={
+          isWindows
+            ? t('settings.perf_torch_compile_note', {
+                defaultValue: 'Falls back to eager mode — fixes Triton OOM on <16 GB GPUs.',
+              })
+            : undefined
+        }
+        hint={
+          <Trans
+            i18nKey="settings.perf_torch_compile_hint"
+            defaults="Workaround for <issueLink>#65</issueLink> — Windows users may hit Triton / <code>torch.compile</code> OOM during model load on GPUs with less than 16 GB VRAM. Enabling this sets <code>TORCH_COMPILE_DISABLE=1</code> on engine subprocesses, which falls back to eager mode. macOS and Linux are unaffected."
+            components={{
+              // Trans injects the link text ("#65") from the translation string.
+              issueLink: (
+                <a
+                  href="https://github.com/debpalash/VoiceStudio/issues/65"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                />
+              ),
+              code: <code />,
+            }}
+          />
+        }
+        control={
+          <SettingsToggle
+            checked={enabled}
+            onChange={onToggle}
+            disabled={!isWindows || saving || loading}
+            aria-label={toggleLabel}
+            data-testid="torch-compile-toggle"
+          />
+        }
+      />
+    </SettingsSection>
   );
 }

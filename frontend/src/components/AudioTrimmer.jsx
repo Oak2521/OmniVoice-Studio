@@ -1,19 +1,26 @@
-import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { Scissors, Play, Pause, Check, ZoomIn, ZoomOut, Maximize2, Repeat } from 'lucide-react';
 import {
-  clamp, encodeWav, computePeaksFromChannel, computePeaksAsync, pickTickInterval,
-  xToTime as xToTimeUtil, pickHandle as pickHandleUtil,
-  applyDrag as applyDragUtil, zoomAtCursor, zoomCenter, sliceToMono,
-  decodeToMonoLowRate, DEFAULT_PEAK_BUCKETS,
+  clamp,
+  encodeWav,
+  computePeaksFromChannel,
+  computePeaksAsync,
+  pickTickInterval,
+  xToTime as xToTimeUtil,
+  pickHandle as pickHandleUtil,
+  applyDrag as applyDragUtil,
+  zoomAtCursor,
+  zoomCenter,
+  sliceToMono,
+  selectionPlayhead,
+  loopWindow,
+  decodeToMonoLowRate,
+  DEFAULT_PEAK_BUCKETS,
 } from '../utils/audioTrim.js';
 import { Dialog, Button } from '../ui';
 import { useTranslation } from 'react-i18next';
-import './AudioTrimmer.css';
 
 const EDGE_GRAB_PX = 10;
-
-const computePeaks = (buffer, buckets = DEFAULT_PEAK_BUCKETS) =>
-  computePeaksFromChannel(buffer.getChannelData(0), buckets);
 
 function fmtSec(t, precision = 2) {
   if (!isFinite(t)) return '0.00s';
@@ -33,7 +40,11 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
   const { t } = useTranslation();
   const waveRef = useRef(null);
   const rulerRef = useRef(null);
-  const audioRef = useRef(null);
+  const audioCtxRef = useRef(null);
+  const sourceRef = useRef(null);
+  const playClockRef = useRef(null);
+  const playRafRef = useRef(0);
+  const loopRef = useRef(true);
   const containerRef = useRef(null);
   const bufferRef = useRef(null);
   const peaksRef = useRef(null);
@@ -61,13 +72,21 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
 
   useEffect(() => {
     stateRef.current = {
-      start, end, cursor, viewStart, viewEnd,
+      start,
+      end,
+      cursor,
+      viewStart,
+      viewEnd,
       duration: bufferRef.current ? bufferRef.current.duration : 0,
     };
   }, [start, end, cursor, viewStart, viewEnd]);
 
-  useEffect(() => { setStartInput(start.toFixed(2)); }, [start]);
-  useEffect(() => { setEndInput(end.toFixed(2)); }, [end]);
+  useEffect(() => {
+    setStartInput(start.toFixed(2));
+  }, [start]);
+  useEffect(() => {
+    setEndInput(end.toFixed(2));
+  }, [end]);
 
   // Decode (low rate mono) + async peaks — keeps UI responsive for long files.
   useEffect(() => {
@@ -95,7 +114,9 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
         const refined = await computePeaksAsync(
           buf.getChannelData(0),
           DEFAULT_PEAK_BUCKETS,
-          (p) => { if (!cancelled) setPeakProgress(p); },
+          (p) => {
+            if (!cancelled) setPeakProgress(p);
+          },
         );
         if (cancelled) return;
         peaksRef.current = refined;
@@ -105,20 +126,16 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
         setDecoding(false);
       }
     })();
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, [file, maxSeconds]);
 
-  // Bind audio src
+  // Keep the latest loop preference readable from the rAF playhead loop and the
+  // live-bounds effect without re-subscribing them.
   useEffect(() => {
-    if (!file) return;
-    const url = URL.createObjectURL(file);
-    const a = audioRef.current;
-    if (a) { a.src = url; a.load(); }
-    return () => {
-      if (a) { try { a.pause(); a.removeAttribute('src'); a.load(); } catch {} }
-      URL.revokeObjectURL(url);
-    };
-  }, [file]);
+    loopRef.current = loop;
+  }, [loop]);
 
   const sizeCanvas = useCallback((canvas) => {
     if (!canvas) return null;
@@ -142,7 +159,14 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
     const ctx = canvas.getContext('2d');
     ctx.clearRect(0, 0, w, h);
 
-    const { viewStart: vs, viewEnd: ve, start: s, end: e, cursor: c, duration: dur } = stateRef.current;
+    const {
+      viewStart: vs,
+      viewEnd: ve,
+      start: s,
+      end: e,
+      cursor: c,
+      duration: dur,
+    } = stateRef.current;
     const viewDur = Math.max(1e-6, ve - vs);
     const totalBuckets = peaks.length / 2;
     const secPerBucket = dur / totalBuckets;
@@ -164,7 +188,8 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
     for (let x = 0; x < w; x++) {
       const t0 = vs + (x / w) * viewDur;
       const t1 = vs + ((x + 1) / w) * viewDur;
-      let mn = 1, mx = -1;
+      let mn = 1,
+        mx = -1;
       if (useRaw) {
         const i0 = Math.max(0, Math.floor(t0 * sr));
         const i1 = Math.min(ch.length, Math.ceil(t1 * sr));
@@ -183,7 +208,10 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
           if (pmx > mx) mx = pmx;
         }
       }
-      if (mx < mn) { mn = 0; mx = 0; }
+      if (mx < mn) {
+        mn = 0;
+        mx = 0;
+      }
       const y1 = (1 - mx) * 0.5 * h;
       const y2 = (1 - mn) * 0.5 * h;
       ctx.fillRect(x, y1, 1, Math.max(1, y2 - y1));
@@ -206,7 +234,8 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
     for (let x = Math.max(0, Math.floor(sx)); x < Math.min(w, Math.ceil(ex)); x++) {
       const t0 = vs + (x / w) * viewDur;
       const t1 = vs + ((x + 1) / w) * viewDur;
-      let mn = 1, mx = -1;
+      let mn = 1,
+        mx = -1;
       if (useRaw) {
         const i0 = Math.max(0, Math.floor(t0 * sr));
         const i1 = Math.min(ch.length, Math.ceil(t1 * sr));
@@ -225,7 +254,10 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
           if (pmx > mx) mx = pmx;
         }
       }
-      if (mx < mn) { mn = 0; mx = 0; }
+      if (mx < mn) {
+        mn = 0;
+        mx = 0;
+      }
       const y1 = (1 - mx) * 0.5 * h;
       const y2 = (1 - mn) * 0.5 * h;
       ctx.fillRect(x, y1, 1, Math.max(1, y2 - y1));
@@ -292,7 +324,9 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
     });
   }, [drawWave, drawRuler]);
 
-  useEffect(() => { scheduleDraw(); }, [start, end, cursor, viewStart, viewEnd, ready, scheduleDraw]);
+  useEffect(() => {
+    scheduleDraw();
+  }, [start, end, cursor, viewStart, viewEnd, ready, scheduleDraw]);
 
   useEffect(() => {
     const onResize = () => scheduleDraw();
@@ -308,8 +342,12 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
   const xToTime = (clientX) => {
     const rect = canvasRect();
     if (!rect) return 0;
-    return xToTimeUtil(clientX - rect.left, rect.width,
-      stateRef.current.viewStart, stateRef.current.viewEnd);
+    return xToTimeUtil(
+      clientX - rect.left,
+      rect.width,
+      stateRef.current.viewStart,
+      stateRef.current.viewEnd,
+    );
   };
 
   const pickHandleAt = (clientX) => {
@@ -327,16 +365,25 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
     if (!buffer || !rect) return;
     const drag = dragStateRef.current;
     if (!drag) {
-      const t = xToTimeUtil(pos.clientX - rect.left, rect.width,
-        stateRef.current.viewStart, stateRef.current.viewEnd);
+      const t = xToTimeUtil(
+        pos.clientX - rect.left,
+        rect.width,
+        stateRef.current.viewStart,
+        stateRef.current.viewEnd,
+      );
       setCursor(clamp(t, 0, stateRef.current.duration));
       return;
     }
     const out = applyDragUtil(stateRef.current, pos.clientX, rect.left, rect.width, drag, 0.02);
     if (drag.mode === 'start') setStart(out.start);
     else if (drag.mode === 'end') setEnd(out.end);
-    else if (drag.mode === 'region' || drag.mode === 'new') { setStart(out.start); setEnd(out.end); }
-    else if (drag.mode === 'pan') { setViewStart(out.viewStart); setViewEnd(out.viewEnd); }
+    else if (drag.mode === 'region' || drag.mode === 'new') {
+      setStart(out.start);
+      setEnd(out.end);
+    } else if (drag.mode === 'pan') {
+      setViewStart(out.viewStart);
+      setViewEnd(out.viewEnd);
+    }
   }, []);
 
   const schedulePointer = useCallback(() => {
@@ -352,7 +399,10 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
       pointerRef.current = { clientX: e.clientX };
       schedulePointer();
     };
-    const up = () => { dragStateRef.current = null; pointerRef.current = null; };
+    const up = () => {
+      dragStateRef.current = null;
+      pointerRef.current = null;
+    };
     window.addEventListener('mousemove', move);
     window.addEventListener('mouseup', up);
     return () => {
@@ -393,8 +443,6 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
       setStart(t);
       setEnd(t);
       setCursor(t);
-      const a = audioRef.current;
-      if (a) { try { a.currentTime = t; } catch {} }
       dragStateRef.current = { mode: 'new', anchorT: t };
     }
     pointerRef.current = { clientX: e.clientX };
@@ -427,30 +475,38 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
   useEffect(() => {
     const canvas = waveRef.current;
     if (!canvas) return;
-    const handler = (e) => { if (ready) onWheel(e); };
+    const handler = (e) => {
+      if (ready) onWheel(e);
+    };
     canvas.addEventListener('wheel', handler, { passive: false });
     return () => canvas.removeEventListener('wheel', handler);
   }, [onWheel, ready]);
 
   const zoomIn = () => {
-    const buffer = bufferRef.current; if (!buffer) return;
+    const buffer = bufferRef.current;
+    if (!buffer) return;
     const { viewStart: vs, viewEnd: ve } = stateRef.current;
     const out = zoomCenter(vs, ve, buffer.duration, 0.5);
-    setViewStart(out.viewStart); setViewEnd(out.viewEnd);
+    setViewStart(out.viewStart);
+    setViewEnd(out.viewEnd);
   };
   const zoomOut = () => {
-    const buffer = bufferRef.current; if (!buffer) return;
+    const buffer = bufferRef.current;
+    if (!buffer) return;
     const { viewStart: vs, viewEnd: ve } = stateRef.current;
     const out = zoomCenter(vs, ve, buffer.duration, 2);
-    setViewStart(out.viewStart); setViewEnd(out.viewEnd);
+    setViewStart(out.viewStart);
+    setViewEnd(out.viewEnd);
   };
   const fitAll = () => {
-    const buffer = bufferRef.current; if (!buffer) return;
+    const buffer = bufferRef.current;
+    if (!buffer) return;
     setViewStart(0);
     setViewEnd(buffer.duration);
   };
   const fitSelection = () => {
-    const buffer = bufferRef.current; if (!buffer) return;
+    const buffer = bufferRef.current;
+    if (!buffer) return;
     const { start: s, end: e } = stateRef.current;
     const pad = Math.max(0.1, (e - s) * 0.2);
     const nvs = clamp(s - pad, 0, buffer.duration);
@@ -459,48 +515,116 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
     setViewEnd(nve);
   };
 
-  const togglePlay = () => {
-    const a = audioRef.current;
-    if (!a) return;
-    if (playing) { a.pause(); setPlaying(false); return; }
-    const s = stateRef.current.start;
-    const doPlay = () => {
-      try { a.currentTime = s; } catch (err) { console.warn('currentTime set failed', err); }
-      a.play().then(() => setPlaying(true)).catch((err) => {
-        setError(t('trimmer.playback_failed', { message: err.message || err }));
-      });
+  // Preview plays the SAME decoded buffer the waveform is drawn from and the
+  // confirmed clip is sliced from — never the original file on a second media
+  // element. Seeking a media element treats the selection's buffer-seconds as
+  // container-seconds, which drift apart for VBR / mis-reported-duration files
+  // (#1210): the preview then plays a different region than the one selected
+  // and exported. One buffer, one timeline, guarantees they match.
+  const stopPlayback = useCallback(() => {
+    if (playRafRef.current) {
+      cancelAnimationFrame(playRafRef.current);
+      playRafRef.current = 0;
+    }
+    const src = sourceRef.current;
+    sourceRef.current = null;
+    playClockRef.current = null;
+    if (src) {
+      try {
+        src.onended = null;
+        src.stop();
+      } catch {}
+    }
+    setPlaying(false);
+  }, []);
+
+  const startPlayhead = useCallback(() => {
+    const tick = () => {
+      const ctx = audioCtxRef.current;
+      const clock = playClockRef.current;
+      if (!ctx || !clock || !sourceRef.current) {
+        playRafRef.current = 0;
+        return;
+      }
+      const { start: s, end: e } = stateRef.current;
+      const elapsed = ctx.currentTime - clock.t0;
+      setCursor(selectionPlayhead(s, e, elapsed, loopRef.current));
+      if (!loopRef.current && elapsed >= Math.max(1e-6, e - s)) {
+        stopPlayback();
+        return;
+      }
+      playRafRef.current = requestAnimationFrame(tick);
     };
-    // HAVE_METADATA = 1 is enough to set currentTime on most browsers.
-    if (a.readyState >= 1) {
-      doPlay();
-    } else {
-      a.addEventListener('loadedmetadata', doPlay, { once: true });
-      a.addEventListener('error', () => setError(t('trimmer.audio_load_failed')), { once: true });
+    if (!playRafRef.current) playRafRef.current = requestAnimationFrame(tick);
+  }, [stopPlayback]);
+
+  const togglePlay = () => {
+    const buffer = bufferRef.current;
+    if (!buffer) return;
+    if (playing) {
+      stopPlayback();
+      return;
+    }
+    try {
+      let ctx = audioCtxRef.current;
+      if (!ctx) {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        ctx = new Ctx();
+        audioCtxRef.current = ctx;
+      }
+      if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+      const { start: s, end: e } = stateRef.current;
+      // loopWindow floors a zero-width/inverted selection so the loop range can
+      // never collapse and fall back to looping the whole buffer (#1210).
+      const { loopStart, loopEnd, seg } = loopWindow(s, e, buffer.duration);
+      const src = ctx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(ctx.destination);
+      if (loopRef.current) {
+        src.loop = true;
+        src.loopStart = loopStart;
+        src.loopEnd = loopEnd;
+        src.start(0, loopStart);
+      } else {
+        src.start(0, loopStart, seg);
+        src.onended = () => {
+          if (sourceRef.current === src) stopPlayback();
+        };
+      }
+      sourceRef.current = src;
+      playClockRef.current = { t0: ctx.currentTime };
+      setPlaying(true);
+      startPlayhead();
+    } catch (err) {
+      setError(t('trimmer.playback_failed', { message: err.message || err }));
     }
   };
 
+  // Editing the selection mid-preview retargets the live loop window so what
+  // you hear keeps matching the (moving) selection.
   useEffect(() => {
-    const a = audioRef.current;
-    if (!a) return;
-    let raf;
-    const tick = () => {
-      if (!a.paused) {
-        setCursor(a.currentTime);
-        const { start: s, end: e } = stateRef.current;
-        if (a.currentTime >= e) {
-          if (loop) {
-            try { a.currentTime = s; } catch {}
-          } else {
-            a.pause();
-            setPlaying(false);
-          }
-        }
+    const src = sourceRef.current;
+    if (!src || !src.loop) return;
+    if (end > start) {
+      src.loopStart = start;
+      src.loopEnd = end;
+    }
+  }, [start, end]);
+
+  // Tear playback down on unmount so the AudioContext and its rAF never leak.
+  useEffect(
+    () => () => {
+      stopPlayback();
+      const ctx = audioCtxRef.current;
+      audioCtxRef.current = null;
+      if (ctx) {
+        try {
+          ctx.close();
+        } catch {}
       }
-      raf = requestAnimationFrame(tick);
-    };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
-  }, [loop]);
+    },
+    [stopPlayback],
+  );
 
   const duration = end - start;
   const tooLong = duration > maxSeconds;
@@ -525,7 +649,11 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
     const tgt = e.target;
     if (tgt && (tgt.tagName === 'INPUT' || tgt.tagName === 'TEXTAREA')) return;
     const fine = e.shiftKey ? 0.01 : e.altKey ? 1.0 : 0.1;
-    if (e.key === ' ' || e.code === 'Space') { e.preventDefault(); togglePlay(); return; }
+    if (e.key === ' ' || e.code === 'Space') {
+      e.preventDefault();
+      togglePlay();
+      return;
+    }
     if (e.key === 'ArrowLeft') {
       e.preventDefault();
       if (e.ctrlKey || e.metaKey) setEnd(clamp(end - fine, start + 0.02, buffer.duration));
@@ -534,16 +662,30 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
       e.preventDefault();
       if (e.ctrlKey || e.metaKey) setEnd(clamp(end + fine, start + 0.02, buffer.duration));
       else setStart(clamp(start + fine, 0, Math.max(0, end - 0.02)));
-    } else if (e.key === '+' || e.key === '=') { e.preventDefault(); zoomIn(); }
-    else if (e.key === '-' || e.key === '_') { e.preventDefault(); zoomOut(); }
-    else if (e.key === 'Home') { e.preventDefault(); fitAll(); }
-    else if (e.key === 'End') { e.preventDefault(); fitSelection(); }
-    else if (e.key === 'Escape') { e.preventDefault(); onCancel(); }
-    else if (e.key === 'Enter') { if (!tooLong && !tooShort) handleConfirm(); }
+    } else if (e.key === '+' || e.key === '=') {
+      e.preventDefault();
+      zoomIn();
+    } else if (e.key === '-' || e.key === '_') {
+      e.preventDefault();
+      zoomOut();
+    } else if (e.key === 'Home') {
+      e.preventDefault();
+      fitAll();
+    } else if (e.key === 'End') {
+      e.preventDefault();
+      fitSelection();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      onCancel();
+    } else if (e.key === 'Enter') {
+      if (!tooLong && !tooShort) handleConfirm();
+    }
   };
 
   const keyHandlerRef = useRef(onKeyDown);
-  useEffect(() => { keyHandlerRef.current = onKeyDown; }, [onKeyDown]);
+  useEffect(() => {
+    keyHandlerRef.current = onKeyDown;
+  }, [onKeyDown]);
 
   useEffect(() => {
     const node = containerRef.current;
@@ -571,70 +713,151 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
       open
       onClose={onCancel}
       size="xl"
-      title={<><Scissors size={15} color="var(--color-brand)" /> {t('trimmer.title')}</>}
+      title={
+        <>
+          <Scissors size={15} color="var(--color-brand)" /> {t('trimmer.title')}
+        </>
+      }
     >
       <div ref={containerRef} tabIndex={-1} className="audio-trimmer">
-        <div className="audio-trimmer__meta">
-          <span>{decoding
-            ? t('trimmer.decoding')
-            : (audioMeta
+        <div className="flex gap-[var(--space-6)] items-center [font-size:var(--text-base)] text-fg-muted">
+          <span>
+            {decoding
+              ? t('trimmer.decoding')
+              : audioMeta
                 ? `${t('trimmer.meta_length', { duration: fmtHMS(audioMeta.duration), sampleRate: audioMeta.sampleRate })}${peakProgress > 0 && peakProgress < 1 ? ` · ${t('trimmer.meta_rendering', { percent: Math.round(peakProgress * 100) })}` : ''}`
-                : '…')
-          }</span>
-          <span className="audio-trimmer__hint">
+                : '…'}
+          </span>
+          <span className="ml-auto text-fg-subtle [font-size:var(--text-2xs)]">
             {t('trimmer.keyboard_hint')}
           </span>
         </div>
 
-        {error && <div className="audio-trimmer__error">{error}</div>}
+        {error && <div className="text-danger [font-size:var(--text-md)]">{error}</div>}
 
         {/* Zoom controls */}
-        <div className="audio-trimmer__toolbar">
-          <Button variant="subtle" iconSize="md" onClick={zoomIn}        disabled={!ready} title={t('trimmer.zoom_in')}><ZoomIn size={12}/></Button>
-          <Button variant="subtle" iconSize="md" onClick={zoomOut}       disabled={!ready} title={t('trimmer.zoom_out')}><ZoomOut size={12}/></Button>
-          <Button variant="subtle" iconSize="md" onClick={fitAll}        disabled={!ready} title={t('trimmer.fit_all')}><Maximize2 size={12}/></Button>
-          <Button variant="chip"   size="sm"    onClick={fitSelection} disabled={!ready} title={t('trimmer.fit_selection')}>{t('trimmer.fit_sel_btn')}</Button>
-          <div className="audio-trimmer__view-info">
-            {t('trimmer.view_range', { start: fmtHMS(viewStart), end: fmtHMS(viewEnd), duration: fmtSec(viewEnd - viewStart, viewEnd - viewStart < 10 ? 2 : 0) })}
+        <div className="flex gap-[var(--space-2)] items-center">
+          <Button
+            variant="subtle"
+            iconSize="md"
+            onClick={zoomIn}
+            disabled={!ready}
+            title={t('trimmer.zoom_in')}
+          >
+            <ZoomIn size={12} />
+          </Button>
+          <Button
+            variant="subtle"
+            iconSize="md"
+            onClick={zoomOut}
+            disabled={!ready}
+            title={t('trimmer.zoom_out')}
+          >
+            <ZoomOut size={12} />
+          </Button>
+          <Button
+            variant="subtle"
+            iconSize="md"
+            onClick={fitAll}
+            disabled={!ready}
+            title={t('trimmer.fit_all')}
+          >
+            <Maximize2 size={12} />
+          </Button>
+          <Button
+            variant="chip"
+            size="sm"
+            onClick={fitSelection}
+            disabled={!ready}
+            title={t('trimmer.fit_selection')}
+          >
+            {t('trimmer.fit_sel_btn')}
+          </Button>
+          <div className="ml-auto [font-size:var(--text-sm)] text-fg-subtle tabular-nums">
+            {t('trimmer.view_range', {
+              start: fmtHMS(viewStart),
+              end: fmtHMS(viewEnd),
+              duration: fmtSec(viewEnd - viewStart, viewEnd - viewStart < 10 ? 2 : 0),
+            })}
           </div>
         </div>
 
         {/* Ruler */}
-        <canvas ref={rulerRef} className="audio-trimmer__ruler" />
+        <canvas
+          ref={rulerRef}
+          className="w-full h-[18px] bg-[#141414] rounded-md border-b border-solid border-b-transparent"
+        />
 
         {/* Waveform */}
-        <canvas ref={waveRef} onMouseDown={onCanvasDown} className="audio-trimmer__wave" />
+        <canvas
+          ref={waveRef}
+          onMouseDown={onCanvasDown}
+          className="w-full h-[160px] bg-[#0f1112] rounded-lg border border-solid border-transparent cursor-crosshair touch-none"
+        />
 
         {/* Numeric fields */}
-        <div className="audio-trimmer__fields">
-          <label className="trim-field">
-            <span className="trim-field__label">{t('trimmer.start_label')}</span>
+        <div className="grid grid-cols-[1fr_1fr_1fr_auto] gap-[var(--space-4)] items-center">
+          <label className="flex items-center gap-[var(--space-2)] bg-[#0f1112] border border-solid border-border rounded-md px-[6px] py-[2px]">
+            <span className="[font-size:var(--text-xs)] text-fg-subtle uppercase [letter-spacing:0.05em] font-semibold">
+              {t('trimmer.start_label')}
+            </span>
             <input
-              type="text" inputMode="decimal" value={startInput}
+              type="text"
+              inputMode="decimal"
+              value={startInput}
               onChange={(e) => setStartInput(e.target.value)}
               onBlur={commitStartInput}
-              onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); commitStartInput(); } }}
-              className="trim-field__input"
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  commitStartInput();
+                }
+              }}
+              className="bg-transparent border-0 outline-none text-fg [font-size:var(--text-md)] px-[6px] py-[4px] w-full min-w-[60px] font-mono"
             />
-            <span className="trim-field__unit">{t('trimmer.unit_seconds')}</span>
+            <span className="[font-size:var(--text-xs)] text-fg-subtle">
+              {t('trimmer.unit_seconds')}
+            </span>
           </label>
-          <label className="trim-field">
-            <span className="trim-field__label">{t('trimmer.end_label')}</span>
+          <label className="flex items-center gap-[var(--space-2)] bg-[#0f1112] border border-solid border-border rounded-md px-[6px] py-[2px]">
+            <span className="[font-size:var(--text-xs)] text-fg-subtle uppercase [letter-spacing:0.05em] font-semibold">
+              {t('trimmer.end_label')}
+            </span>
             <input
-              type="text" inputMode="decimal" value={endInput}
+              type="text"
+              inputMode="decimal"
+              value={endInput}
               onChange={(e) => setEndInput(e.target.value)}
               onBlur={commitEndInput}
-              onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); commitEndInput(); } }}
-              className="trim-field__input"
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  commitEndInput();
+                }
+              }}
+              className="bg-transparent border-0 outline-none text-fg [font-size:var(--text-md)] px-[6px] py-[4px] w-full min-w-[60px] font-mono"
             />
-            <span className="trim-field__unit">{t('trimmer.unit_seconds')}</span>
-          </label>
-          <div className="trim-field trim-field--readonly">
-            <span className="trim-field__label">{t('trimmer.length_label')}</span>
-            <span className={`trim-field__value ${tooLong ? 'is-err' : ''}`}>
-              {(duration_ms / 1000).toFixed(2)}{t('trimmer.unit_seconds')}
+            <span className="[font-size:var(--text-xs)] text-fg-subtle">
+              {t('trimmer.unit_seconds')}
             </span>
-            <span className="trim-field__unit">{tooLong ? t('trimmer.too_long', { max: maxSeconds }) : tooShort ? t('trimmer.too_short') : t('trimmer.length_ok')}</span>
+          </label>
+          <div className="flex items-center gap-[var(--space-2)] bg-[#0f1112] border border-solid border-border rounded-md px-[6px] py-[2px] cursor-default">
+            <span className="[font-size:var(--text-xs)] text-fg-subtle uppercase [letter-spacing:0.05em] font-semibold">
+              {t('trimmer.length_label')}
+            </span>
+            <span
+              className={`px-[6px] py-[4px] font-mono [font-size:var(--text-md)] flex-1 ${tooLong ? 'text-danger' : 'text-[#b8bb26]'}`}
+            >
+              {(duration_ms / 1000).toFixed(2)}
+              {t('trimmer.unit_seconds')}
+            </span>
+            <span className="[font-size:var(--text-xs)] text-fg-subtle">
+              {tooLong
+                ? t('trimmer.too_long', { max: maxSeconds })
+                : tooShort
+                  ? t('trimmer.too_short')
+                  : t('trimmer.length_ok')}
+            </span>
           </div>
           <Button
             variant="icon"
@@ -648,7 +871,7 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
         </div>
 
         {/* Play / Action row */}
-        <div className="audio-trimmer__actions">
+        <div className="flex gap-[var(--space-4)] items-center flex-wrap">
           <Button
             variant="subtle"
             onClick={togglePlay}
@@ -658,12 +881,16 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
           >
             {playing ? t('trimmer.pause') : t('trimmer.preview_selection')}
           </Button>
-          <span className="audio-trimmer__kbd-hint">{t('trimmer.play_hint')}</span>
+          <span className="[font-size:var(--text-base)] text-fg-subtle">
+            {t('trimmer.play_hint')}
+          </span>
 
-          <div className="audio-trimmer__actions-right">
-            <Button variant="ghost" onClick={onCancel}>{t('trimmer.cancel')}</Button>
+          <div className="ml-auto flex gap-[var(--space-4)]">
+            <Button variant="ghost" onClick={onCancel}>
+              {t('trimmer.cancel')}
+            </Button>
             <Button
-              variant={(tooLong || tooShort) ? 'danger' : 'primary'}
+              variant={tooLong || tooShort ? 'danger' : 'primary'}
               disabled={!ready || tooLong || tooShort}
               onClick={handleConfirm}
               leading={<Check size={12} />}
@@ -672,8 +899,6 @@ export default function AudioTrimmer({ file, maxSeconds = 15, onConfirm, onCance
             </Button>
           </div>
         </div>
-
-        <audio ref={audioRef} preload="auto" onEnded={() => setPlaying(false)} className="audio-trimmer__audio" />
       </div>
     </Dialog>
   );

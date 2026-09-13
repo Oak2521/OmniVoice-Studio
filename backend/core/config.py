@@ -15,6 +15,18 @@ def get_app_data_dir():
         return os.path.expanduser("~/.omnivoice")
 
 
+def _configured_hf_token_path():
+    """Match Hub's token location without importing or refreshing credentials."""
+    default_cache = os.path.join(os.path.expanduser("~"), ".cache")
+    hf_home = os.environ.get("HF_HOME", os.path.join(os.environ.get("XDG_CACHE_HOME", default_cache), "huggingface"))
+    return os.path.expandvars(os.path.expanduser(os.environ.get("HF_TOKEN_PATH", os.path.join(hf_home, "token"))))
+
+
+# Snapshot recognized locations before automatic model-cache redirection.
+# Explicit cache/token overrides restrict clearing to their selected location.
+HF_CLI_TOKEN_PATHS = (_configured_hf_token_path(),)
+
+
 def _ensure_short_hf_cache_on_windows():
     """Redirect HuggingFace cache to a short path on Windows.
 
@@ -38,6 +50,14 @@ def _ensure_short_hf_cache_on_windows():
         return
     short_cache = os.path.join(local_app, "OmniVoice", "hf_cache")
     os.makedirs(short_cache, exist_ok=True)
+    if "HF_TOKEN_PATH" not in os.environ:
+        global HF_CLI_TOKEN_PATHS
+        canonical = HF_CLI_TOKEN_PATHS[0]
+        legacy = os.path.join(short_cache, "token")
+        HF_CLI_TOKEN_PATHS = tuple(dict.fromkeys((canonical, legacy)))
+        # Keep existing app-written logins usable without copying credentials.
+        selected = canonical if os.path.exists(canonical) or not os.path.exists(legacy) else legacy
+        os.environ.setdefault("HF_TOKEN_PATH", selected)
     os.environ["HF_HOME"] = short_cache
     os.environ["HF_HUB_CACHE"] = short_cache
 

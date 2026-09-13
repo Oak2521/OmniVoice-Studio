@@ -1,6 +1,6 @@
 """Tests for backend/core/error_docs_map.py — error → docs URL taxonomy.
 
-The 5-class taxonomy is the contract Phase 5's bug reporter consumes and
+The locked taxonomy is the contract Phase 5's bug reporter consumes and
 the TS-side `frontend/src/utils/errorDocsMap.ts` mirrors. These tests pin
 both the keys and that every URL points back to the project repo.
 """
@@ -33,7 +33,7 @@ def test_all_urls_resolve_to_repo():
 
 
 def test_all_keys_match_taxonomy():
-    """The 5-class taxonomy is locked here. Adding a 6th class is a contract
+    """The taxonomy is locked here. Adding a class is a contract
     change — bump this set + the TS mirror's keys-sync test in lockstep.
 
     PYANNOTE_LICENSE_REQUIRED was added for issue #78 (speaker detection
@@ -48,6 +48,7 @@ def test_all_keys_match_taxonomy():
         "PKG_RESOURCES_MISSING",
         "HF_AUTH_FAILED",
         "PYANNOTE_LICENSE_REQUIRED",
+        "POCKETTTS_GATED_WEIGHTS",
     }
     assert set(error_docs_map.ERROR_DOCS.keys()) == expected
 
@@ -62,3 +63,10 @@ def test_pyannote_license_class_points_at_diarization_docs():
     url = error_docs_map.lookup("PYANNOTE_LICENSE_REQUIRED")
     assert "docs/features/diarization.md" in url
     assert "license-acceptance-flow" in url
+
+
+def test_pockettts_gate_points_at_pockettts_instructions():
+    from core import error_docs_map
+    url = error_docs_map.lookup("POCKETTTS_GATED_WEIGHTS")
+    assert "docs/install/troubleshooting.md" in url
+    assert "pockettts-gated-weights" in url

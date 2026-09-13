@@ -145,6 +145,36 @@ def test_returns_empty_result_for_empty_input():
     assert parse_srt("").skipped_cues == 0
 
 
+def test_blank_line_flood_parses_in_linear_time():
+    # Regression: the timing-line regex used `^\s*` under re.MULTILINE, so at
+    # every one of N line starts the engine consumed all remaining blank
+    # lines before failing — quadratic. 20k blank lines already took ~1.7s
+    # and a 2 MB blank-line file never returned, pinning the request thread
+    # (reachable from /dub/import-srt with a mis-saved export, and from the
+    # pasted-text endpoint). Horizontal-whitespace-only classes make it
+    # linear: this input parses in milliseconds.
+    import time
+
+    srt = "1\n00:00:01,000 --> 00:00:02,000\nOnly cue.\n" + "\n" * 400_000
+    started = time.monotonic()
+    result = parse_srt(srt)
+    elapsed = time.monotonic() - started
+    assert len(result.segments) == 1
+    assert result.segments[0]["text"] == "Only cue."
+    # Pre-fix this was minutes; the bound is loose enough for a slow CI box
+    # and still ~3 orders of magnitude under the quadratic behaviour.
+    assert elapsed < 5.0, f"parse_srt took {elapsed:.1f}s — quadratic scan is back"
+
+
+def test_timing_line_tolerates_leading_and_inner_spaces():
+    # The linearity fix narrowed `\s*` to horizontal whitespace; indented
+    # cues and extra spaces around the arrow must still parse.
+    srt = "  \t00:00:01,000  -->  \t00:00:02,000\nIndented.\n"
+    result = parse_srt(srt)
+    assert len(result.segments) == 1
+    assert result.segments[0]["text"] == "Indented."
+
+
 def test_segments_get_sequential_ids_and_required_fields():
     srt = """1
 00:00:01,000 --> 00:00:02,000

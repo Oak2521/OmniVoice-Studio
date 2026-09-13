@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Start the OmniVoice FastAPI backend on 127.0.0.1:3900, detached, idempotent.
-# Honors $OMNIVOICE_HOME (default ~/OmniVoice-Studio).
+# Honors $OMNIVOICE_HOME (default ~/VoiceStudio).
 #
 # Exit codes:
 #   0   success (already running, or freshly started + healthy within 60s)
@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-HOME_DIR="${OMNIVOICE_HOME:-$HOME/OmniVoice-Studio}"
+HOME_DIR="${OMNIVOICE_HOME:-$HOME/VoiceStudio}"
 URL="${OMNIVOICE_API_URL:-http://127.0.0.1:3900}"
 LOG="$HOME_DIR/backend.log"
 

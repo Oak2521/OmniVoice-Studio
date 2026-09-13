@@ -38,6 +38,10 @@ def main() -> int:
     data_dir, out_path = sys.argv[1], sys.argv[2]
     os.environ["OMNIVOICE_MODEL"] = "test"
     os.environ["OMNIVOICE_DISABLE_FILE_LOG"] = "1"
+    # Early-bind refactor: this subprocess is not pytest, so a bare import
+    # would defer routers/DB behind the startup gate and every probe below
+    # would read 503. The probes measure the classic synchronous boot.
+    os.environ["OMNIVOICE_EAGER_INIT"] = "1"
     os.environ["OMNIVOICE_DATA_DIR"] = data_dir
 
     repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -77,7 +81,7 @@ def main() -> int:
         # Loopback security: a non-loopback origin must be rejected on system
         # routes. Use a bare client (no `with`) so we don't re-enter the app
         # lifespan — re-entry rebinds the module-level task queue to a new event
-        # loop and crashes. The require_loopback dependency only inspects
+        # loop and crashes. The require_admin dependency only inspects
         # request.client.host, which doesn't need lifespan state.
         nl = TestClient(app)  # default client host 'testclient' = non-loopback
         ctx["loopback_reject_status"] = nl.get("/system/info").status_code

@@ -3,7 +3,9 @@
 Extracted from the monolithic ``setup.py``.
 
 - ``GET /setup/status``       — missing-model gate for boot screen
-- ``GET /setup/preflight``    — system health check (OS, RAM, GPU, ffmpeg…)
+- ``GET /setup/preflight``    — system health check (OS, RAM, disk, GPU, network —
+  genuine user facts only; the media engine (ffmpeg/ffprobe/yt-dlp) is an
+  internal concern that self-heals via ``services.media_tools``)
 - ``POST /setup/warmup``      — background model pre-load
 """
 from __future__ import annotations
@@ -12,39 +14,26 @@ import asyncio
 import logging
 import os
 import platform as _platform
-import shutil as _shutil
 import sys
 
 from fastapi import APIRouter
 
 from api.schemas import SetupStatusResponse, PreflightResponse
-from .models import REQUIRED_MODELS, hf_cache_dir, is_cached
+from core.device_caps import KERNEL_RISK_MARKER
+# MIN_FREE_GB + disk_free_bytes are single-sourced in ``.models`` (the lowest
+# module in the setup import graph) so the wizard gate, the /models header, and
+# the per-install disk guard can't drift apart.
+from .models import REQUIRED_MODELS, hf_cache_dir, is_cached, MIN_FREE_GB, disk_free_bytes
 
 logger = logging.getLogger("omnivoice.setup.wizard")
 router = APIRouter()
 
-MIN_FREE_GB = 10
-
 
 def _disk_free_gb(path: str) -> float:
-    """Return free GB on the volume containing *path*.
-
-    If *path* doesn't exist yet (e.g. after a fresh wipe), walk up to the
-    nearest existing ancestor so ``shutil.disk_usage`` can still probe the
-    correct mount point.
-    """
-    try:
-        from pathlib import Path
-        p = Path(path).resolve()
-        # Walk up until we find a directory that exists
-        while not p.exists():
-            parent = p.parent
-            if parent == p:  # root
-                break
-            p = parent
-        return _shutil.disk_usage(str(p)).free / (1024 ** 3)
-    except Exception:
-        return 0.0
+    """Free GB on the volume containing *path* (thin GB wrapper over the shared
+    ``models.disk_free_bytes``, which walks up to the nearest existing ancestor
+    for a not-yet-created path)."""
+    return disk_free_bytes(path) / (1024 ** 3)
 
 
 # ── Setup Status ───────────────────────────────────────────────────────────
@@ -74,6 +63,11 @@ def setup_status():
 _MIN_NVIDIA_DRIVER = 555
 _RAM_FAIL_GB = 8
 _RAM_WARN_GB = 12
+# Installed DIMMs never fully reach the OS: firmware, integrated graphics and
+# kernel reservations shave off up to ~7% (an "8 GB" Windows laptop reports
+# ~7.8 GB usable). Thresholds are compared with this allowance applied so the
+# machines a threshold is meant to admit aren't blocked by that gap (#1618).
+_RAM_RESERVED_ALLOWANCE = 0.93
 
 
 def _run_cmd(args: list[str], timeout: float = 2.0) -> tuple[int, str]:
@@ -181,14 +175,158 @@ def _detect_gpu() -> dict:
     return info
 
 
-def _probe_network(host: str = "huggingface.co", timeout: float = 2.0) -> bool:
-    """Tiny TCP connect test."""
+def _probe_network(host: str = "huggingface.co", port: int = 443, timeout: float = 8.0) -> bool:
+    """Tiny TCP connect test. 8s default — high-latency / China paths often exceed 2–3s."""
     import socket
     try:
-        with socket.create_connection((host, 443), timeout=timeout):
+        with socket.create_connection((host, port), timeout=timeout):
             return True
     except Exception:
         return False
+
+
+def _hf_endpoint_host() -> tuple[str, int]:
+    """Host/port of the Hugging Face endpoint actually in effect.
+
+    Mirror-aware: restricted-network users (e.g. behind the Great Firewall)
+    point HF_ENDPOINT at a mirror via Settings → Network → Hugging Face
+    mirror. Probing hardcoded huggingface.co would fail them even when their
+    configured mirror works fine.
+    """
+    try:
+        from core.failure import configured_hf_mirror
+        mirror = configured_hf_mirror()
+    except Exception:
+        logger.warning("Configured Hugging Face endpoint could not be read")
+        return "", 0
+    if mirror:
+        try:
+            from urllib.parse import urlsplit
+            u = urlsplit(mirror)
+            if u.hostname:
+                return u.hostname, u.port or (80 if u.scheme == "http" else 443)
+        except Exception:
+            logger.warning("Configured Hugging Face endpoint could not be parsed")
+            return "", 0
+        logger.warning("Configured Hugging Face endpoint has no host")
+        return "", 0
+    return "huggingface.co", 443
+
+
+def _network_check() -> dict:
+    """The preflight "network" check row — auto-race or explicit-endpoint probe.
+
+    Auto mode (nothing explicitly configured): force a fresh endpoint race —
+    preflight IS the connectivity health check, and the cached winner is what
+    model downloads will use. Manual mode: probe exactly the configured
+    endpoint (never auto-switch an explicit choice), keeping the mirror
+    quick-pick affordance when the official endpoint is blocked.
+    """
+    auto_decision = None
+    try:
+        from services import endpoint_race
+        if endpoint_race.mode() == "auto":
+            auto_decision = endpoint_race.ensure_decision(force=True)
+    except Exception as exc:  # the race must never break preflight
+        logger.warning("preflight endpoint race failed: %s", exc)
+
+    if auto_decision is not None:
+        from urllib.parse import urlsplit
+        from services.endpoint_race import CANONICAL_ENDPOINT
+
+        picked = auto_decision["endpoint"]
+        picked_host = urlsplit(picked).hostname or picked
+        latency = auto_decision.get("latency_ms")
+        latency_s = f" ({latency:.0f} ms)" if isinstance(latency, (int, float)) else ""
+        results = {r["endpoint"]: r for r in auto_decision.get("results", [])}
+        canonical_ok = bool(results.get(CANONICAL_ENDPOINT, {}).get("reachable"))
+        mirror_reachable = any(
+            r.get("reachable") for ep, r in results.items() if ep != CANONICAL_ENDPOINT
+        )
+        if auto_decision.get("reachable"):
+            if picked == CANONICAL_ENDPOINT:
+                detail = f"Reachable{latency_s}"
+            elif not canonical_ok:
+                detail = (
+                    f"huggingface.co is unreachable on this network — using the "
+                    f"community mirror {picked_host}{latency_s} for model "
+                    "downloads. Downloads are checksum-verified by Hugging Face "
+                    "regardless of endpoint; change anytime in Settings → "
+                    "Models → Hugging Face mirror."
+                )
+            else:
+                detail = (
+                    f"Both endpoints reachable — {picked_host}{latency_s} "
+                    "selected (decisively faster here). Change anytime in "
+                    "Settings → Models → Hugging Face mirror."
+                )
+            status, fix = "pass", None
+        else:
+            status = "warn"
+            detail = "No Hugging Face endpoint reachable"
+            fix = (
+                "Neither huggingface.co nor the hf-mirror.com community mirror "
+                "responded — check internet connection, VPN, or firewall. You "
+                "can continue — models already downloaded keep working "
+                "offline; a custom mirror can be configured below."
+            )
+        return {
+            "id": "network", "label": f"Network ({picked_host})",
+            "status": status, "detail": detail, "fix": fix,
+            # Frontend affordance hint: the wizard offers the mirror
+            # quick-pick when the check didn't pass (PreflightCheck allows
+            # extras). `endpoint` documents the auto pick for the UI.
+            "mirror_reachable": mirror_reachable,
+            "endpoint": picked,
+        }
+
+    # Manual mode (explicit endpoint) — probe exactly what the user chose.
+    net_host, net_port = _hf_endpoint_host()
+    if not net_host:
+        return {
+            "id": "network", "label": "Network (configured endpoint)",
+            "status": "warn",
+            "detail": "The configured Hugging Face endpoint could not be validated.",
+            "fix": "Review the endpoint in Settings → Network, then re-check.",
+            "mirror_reachable": False,
+        }
+    net_ok = _probe_network(net_host, net_port)
+    mirror_reachable = False
+    if not net_ok and net_host == "huggingface.co":
+        # Official endpoint blocked — if the community mirror is reachable,
+        # tell the user exactly which switch unblocks them.
+        mirror_reachable = _probe_network("hf-mirror.com")
+    if net_ok:
+        net_fix = None
+    elif mirror_reachable:
+        net_fix = (
+            "huggingface.co is blocked on this network, but the hf-mirror.com "
+            "community mirror is reachable — apply it below and re-check. "
+            "Model downloads will use the mirror immediately."
+        )
+    elif net_host != "huggingface.co":
+        net_fix = (
+            f"Your configured Hugging Face mirror ({net_host}) is unreachable "
+            "— it may be down or blocked. Pick another mirror or the official "
+            "endpoint below, or continue offline: models already downloaded "
+            "keep working."
+        )
+    else:
+        net_fix = (
+            "Check internet connection, VPN, or corporate firewall whitelist "
+            "for huggingface.co. You can continue — models already downloaded "
+            "keep working offline; new downloads need a connection or a "
+            "mirror (configurable below)."
+        )
+    return {
+        "id": "network", "label": f"Network ({net_host})",
+        "status": "pass" if net_ok else "warn",
+        "detail": "Reachable" if net_ok else f"Unreachable on port {net_port}",
+        "fix": net_fix,
+        # Frontend affordance hint: the wizard offers the mirror quick-pick
+        # when the endpoint is unreachable (PreflightCheck allows extras).
+        "mirror_reachable": mirror_reachable,
+    }
 
 
 def _ram_gb() -> float:
@@ -220,17 +358,28 @@ def preflight():
 
     # ── RAM
     ram = _ram_gb()
+    # Escape hatch (#1618): a preflight should inform, not brick setup —
+    # OMNIVOICE_RAM_PREFLIGHT=0 downgrades the hard block to a warning for
+    # users who accept the OOM risk. Same opt-out shape as
+    # OMNIVOICE_ASR_VRAM_PREFLIGHT.
+    ram_gate = os.environ.get(
+        "OMNIVOICE_RAM_PREFLIGHT", "1"
+    ).strip().lower() not in ("0", "false", "no")
     if ram == 0:
         ram_status, ram_detail, ram_fix = (
             "warn", "Could not detect system RAM.",
             "Install psutil in the backend environment or ignore this warning.",
         )
-    elif ram < _RAM_FAIL_GB:
+    elif ram < _RAM_FAIL_GB * _RAM_RESERVED_ALLOWANCE:
         ram_status, ram_detail, ram_fix = (
-            "fail", f"{ram:.1f} GB total (need ≥ {_RAM_FAIL_GB} GB)",
-            "The app will OOM on first dub. Close other apps or upgrade RAM.",
+            "fail" if ram_gate else "warn",
+            f"{ram:.1f} GB total (need ≥ {_RAM_FAIL_GB} GB)",
+            "The app will OOM on first dub. Close other apps or upgrade RAM."
+            if ram_gate else
+            "RAM check disabled via OMNIVOICE_RAM_PREFLIGHT=0 — dubbing may "
+            "OOM on this machine.",
         )
-    elif ram < _RAM_WARN_GB:
+    elif ram < _RAM_WARN_GB * _RAM_RESERVED_ALLOWANCE:
         ram_status, ram_detail, ram_fix = (
             "warn", f"{ram:.1f} GB total ({_RAM_WARN_GB}+ GB recommended)",
             "Long videos may hit swap. Keep other apps closed during dubbing.",
@@ -269,59 +418,19 @@ def preflight():
             f"Fix write permissions on {cache} or point HF_HOME elsewhere.",
     })
 
-    # ── FFmpeg
-    ffmpeg_path = None
+    # ── Media engine (ffmpeg/ffprobe/yt-dlp) — deliberately NOT a check row.
+    # These are internal dependencies the app provisions for itself, not user
+    # facts: when the resolution chain has no tier at all, preflight kicks the
+    # bundled acquisition in the background and the wizard shows a quiet
+    # progress line (a failure card only if that fails — with Retry / use a
+    # system copy). yt-dlp is an importable locked module and never appears.
+    # Power users manage all three in Settings → Audio tools.
+    media_tools = None
     try:
-        from services.ffmpeg_utils import find_ffmpeg
-        ffmpeg_path = find_ffmpeg()
-    except Exception as e:
-        checks.append({
-            "id": "ffmpeg", "label": "FFmpeg", "status": "fail",
-            "detail": str(e)[:200],
-            "fix": "Install ffmpeg via your package manager "
-                   "(brew install ffmpeg / apt install ffmpeg / choco install ffmpeg).",
-        })
-    else:
-        checks.append({
-            "id": "ffmpeg", "label": "FFmpeg", "status": "pass",
-            "detail": ffmpeg_path, "fix": None,
-        })
-
-    # ── FFprobe
-    ffprobe_path = None
-    try:
-        from services.ffmpeg_utils import find_ffprobe
-        ffprobe_path = find_ffprobe()
-    except Exception:
-        pass
-    if ffprobe_path:
-        checks.append({
-            "id": "ffprobe", "label": "FFprobe", "status": "pass",
-            "detail": ffprobe_path, "fix": None,
-        })
-    else:
-        checks.append({
-            "id": "ffprobe", "label": "FFprobe", "status": "warn",
-            "detail": "Not bundled alongside ffmpeg.",
-            "fix": "File-probe endpoint (/tools/probe) will 501. "
-                   "Install system ffmpeg (includes ffprobe) to enable it.",
-        })
-
-    # ── yt-dlp
-    yt_dlp_path = _shutil.which("yt-dlp")
-    if yt_dlp_path:
-        rc_ytv, yt_ver = _run_cmd([yt_dlp_path, "--version"], timeout=3.0)
-        yt_version = yt_ver.strip() if rc_ytv == 0 else "unknown"
-        checks.append({
-            "id": "yt-dlp", "label": "yt-dlp", "status": "pass",
-            "detail": f"{yt_dlp_path} (v{yt_version})", "fix": None,
-        })
-    else:
-        checks.append({
-            "id": "yt-dlp", "label": "yt-dlp", "status": "warn",
-            "detail": "Not found in system PATH.",
-            "fix": "YouTube clip downloads in Voice Gallery will fail. Download the standalone binary from https://github.com/yt-dlp/yt-dlp/releases and place it in your PATH.",
-        })
+        from services.media_tools import summary as _media_summary
+        media_tools = _media_summary(auto_acquire=True)
+    except Exception as exc:  # never break preflight on the media engine
+        logger.warning("preflight media_tools summary failed: %s", exc)
 
     # ── GPU
     gpu = _detect_gpu()
@@ -373,16 +482,65 @@ def preflight():
         "status": gpu_status, "detail": gpu_detail, "fix": gpu_fix,
     })
 
-    # ── Network
-    net_ok = _probe_network()
-    checks.append({
-        "id": "network", "label": "Network (huggingface.co)",
-        "status": "pass" if net_ok else "fail",
-        "detail": "Reachable" if net_ok else "Unreachable on port 443",
-        "fix": None if net_ok else
-            "Check internet connection, VPN, or corporate firewall "
-            "whitelist for huggingface.co.",
-    })
+    # ── GPU routing for the ACTIVE TTS engine (#21 — no silent CPU fallback).
+    # Distinct from the hardware "gpu" check above: this asks "will the engine
+    # the user actually selected use that GPU on this host?" Built from the same
+    # canonical probe + resolver the Engine Compatibility Matrix uses.
+    try:
+        from services.tts_backend import gpu_routing_verdict
+        gpu_routing = gpu_routing_verdict()
+    except Exception as exc:  # never break preflight on a routing hiccup
+        logger.warning("preflight gpu_routing failed: %s", exc)
+        gpu_routing = None
+    if gpu_routing:
+        _rs = gpu_routing.get("routing_status")
+        _eng = gpu_routing.get("engine") or "active engine"
+        _dev = gpu_routing.get("effective_device") or "?"
+        _why = gpu_routing.get("routing_reason")
+        if _rs == "accelerated" and not _why:
+            r_status, r_detail, r_fix = "pass", f"{_eng} → {_dev} (accelerated)", None
+        elif _rs == "accelerated" and KERNEL_RISK_MARKER in (_why or ""):
+            r_status, r_detail, r_fix = "warn", f"{_eng} → {_dev}: {_why}", (
+                "GPU selected but may fail at kernel launch — update drivers / "
+                "reinstall torch for this GPU architecture.")
+        elif _rs == "accelerated":  # low-VRAM caveat — not a driver/arch issue
+            r_status, r_detail, r_fix = "warn", f"{_eng} → {_dev}: {_why}", (
+                "Unload other models before generating, keep the text short, "
+                "or pick a lighter engine.")
+        elif _rs == "cpu_fallback":
+            r_status, r_detail, r_fix = "warn", (
+                f"{_eng} runs on CPU here: {_why or 'no GPU path for this host'}"), (
+                "Pick an engine that supports this host's GPU for a speedup, or "
+                "continue on CPU (slower).")
+        elif _rs == "cpu_only":
+            r_status, r_detail, r_fix = "pass", f"{_eng} → cpu (no accelerator on this host)", None
+        elif _rs == "unavailable":
+            r_status, r_detail, r_fix = "fail", (
+                f"{_eng} can't run on this host: {_why or 'needs a GPU this machine lacks'}"), (
+                "Select an engine with a CPU path in Model Catalogue.")
+        else:  # "none" / unknown
+            r_status, r_detail, r_fix = "warn", "No active TTS engine resolved for routing.", (
+                "Pick an engine in Model Catalogue.")
+        checks.append({
+            "id": "gpu_routing", "label": "Active engine routing",
+            "status": r_status, "detail": r_detail, "fix": r_fix,
+        })
+
+    # ── Network — a dead network is a WARNING, not a blocker. The app is
+    # local-first: already-downloaded models work offline, and a hard fail
+    # here dead-ends restricted-network users (e.g. China, where
+    # huggingface.co is blocked) on the very first screen — before they can
+    # reach the mirror setting that fixes it. Model downloads surface their
+    # own actionable errors.
+    #
+    # With NO explicit endpoint configured, preflight runs the automatic
+    # endpoint race (services.endpoint_race): both the official endpoint and
+    # the community mirror are probed, the winner is cached for downloads,
+    # and the copy states the outcome honestly — so a blocked huggingface.co
+    # no longer needs the user to find the mirror setting at all. An explicit
+    # endpoint (Settings / HF_ENDPOINT / pref) keeps the single-endpoint
+    # probe: the user's choice is never auto-switched.
+    checks.append(_network_check())
 
     # Aggregate
     any_fail = any(c["status"] == "fail" for c in checks)
@@ -400,9 +558,14 @@ def preflight():
             "gpu_available": gpu["available"],
             "gpu_driver": gpu["driver"],
             "gpu_device_name": gpu["device_name"],
+            # Canonical probe (distinguishes ROCm from CUDA):
+            "gpu_family": (gpu_routing or {}).get("host_family", "cpu"),
+            "vram_gb": (gpu_routing or {}).get("vram_gb", 0.0),
             "ram_gb": round(ram, 1),
             "disk_free_gb": round(free, 1),
         },
+        "gpu_routing": gpu_routing,
+        "media_tools": media_tools,
     }
 
 

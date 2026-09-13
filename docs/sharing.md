@@ -1,6 +1,6 @@
 # Sharing & Remote Access
 
-OmniVoice runs **local-only by default** — the backend binds to `127.0.0.1` and nothing is reachable from other machines. When you want to use the *same running instance* (same loaded model, same projects and jobs) from another device, you have two opt-in paths. Neither restarts the backend or interrupts work in progress.
+VoiceStudio runs **local-only by default** — the backend binds to `127.0.0.1` and nothing is reachable from other machines. When you want to use the *same running instance* (same loaded model, same projects and jobs) from another device, you have two opt-in paths. Neither restarts the backend or interrupts work in progress.
 
 ## LAN sharing (same Wi-Fi / Ethernet)
 
@@ -16,6 +16,10 @@ For another device on the same network — e.g. opening the web UI on your phone
 
 You can also drive this from **Settings → Sharing & Remote Access**.
 
+Desktop installers include the web interface used by the LAN address; another
+device does not need VoiceStudio installed and the host does not need a source
+checkout or a separate frontend development server.
+
 ### How the PIN works
 - A fresh 6-digit PIN is generated each time you enable sharing; it is never written to disk.
 - The QR encodes the PIN (`…/?pin=######`) so scanning connects in one step. Typing the bare URL instead prompts for the PIN.
@@ -29,7 +33,7 @@ You can also drive this from **Settings → Sharing & Remote Access**.
 
 ## Tailscale (private remote access, from anywhere)
 
-If you have [Tailscale](https://tailscale.com/download) installed and signed in, you can reach OmniVoice from any of your devices over your private tailnet — identity-gated, with **no open ports and no PIN** (Tailscale handles identity, and the WireGuard tunnel encrypts the transport).
+If you have [Tailscale](https://tailscale.com/download) installed and signed in, you can reach VoiceStudio from any of your devices over your private tailnet — identity-gated, with **no open ports and no PIN** (Tailscale handles identity, and the WireGuard tunnel encrypts the transport).
 
 1. **Settings → Sharing & Remote Access → Tailscale.**
 2. If Tailscale isn't detected, an **Install Tailscale** link is shown.

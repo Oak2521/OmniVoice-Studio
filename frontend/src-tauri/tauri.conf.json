@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "OmniVoice Studio",
-  "version": "0.3.5",
+  "productName": "VoiceStudio",
+  "version": "../package.json",
   "identifier": "com.debpalash.omnivoice-studio",
   "build": {
     "frontendDist": "../dist",
@@ -15,25 +15,29 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "OmniVoice Studio",
+        "title": "VoiceStudio",
         "width": 1920,
         "height": 1080,
         "minWidth": 900,
         "minHeight": 600,
         "resizable": true,
         "fullscreen": false,
+        "decorations": false,
         "titleBarStyle": "Overlay",
-        "hiddenTitle": true
+        "hiddenTitle": true,
+        "maximized": true,
+        "dragDropEnabled": false
       },
       {
         "label": "widget",
         "title": "Capture",
-        "width": 300,
-        "height": 64,
+        "width": 460,
+        "height": 164,
         "resizable": false,
         "fullscreen": false,
         "transparent": true,
         "decorations": false,
+        "shadow": false,
         "alwaysOnTop": true,
         "visible": false,
         "skipTaskbar": true,
@@ -45,13 +49,22 @@
       "csp": "default-src 'self' 'unsafe-inline' 'unsafe-eval'; connect-src 'self' ipc://localhost http://localhost:* ws://localhost:* http://127.0.0.1:* ws://127.0.0.1:* blob: data:; media-src 'self' blob: data: http://localhost:* http://127.0.0.1:* asset: https://asset.localhost; img-src 'self' blob: data: asset: https://asset.localhost http://localhost:* http://127.0.0.1:* https://fonts.gstatic.com; font-src 'self' data: https://fonts.googleapis.com https://fonts.gstatic.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;",
       "assetProtocol": {
         "enable": true,
-        "scope": ["**"]
+        "scope": [
+          "**"
+        ]
       }
     }
   },
   "bundle": {
     "active": true,
-    "targets": ["dmg", "app", "msi", "deb", "appimage"],
+    "useLocalToolsDir": true,
+    "targets": [
+      "dmg",
+      "app",
+      "msi",
+      "deb",
+      "appimage"
+    ],
     "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
@@ -60,27 +73,49 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "category": "Music",
     "resources": [
       "../../pyproject.toml",
       "../../uv.lock",
       "../../README.md",
+      "../../CHANGELOG.md",
       "../../omnivoice",
-      "../../backend"
+      "../../backend",
+      "../../frontend/dist"
     ],
     "externalBin": [
       "binaries/uv",
       "binaries/ffmpeg",
       "binaries/ffprobe"
     ],
+    "linux": {
+      "appimage": {
+        "files": {
+          "usr/lib/.bundled-webkitgtk-version": "target/.tauri/bundled-webkitgtk-version",
+          ".DirIcon": "icons/128x128.png"
+        }
+      }
+    },
     "macOS": {
-      "minimumSystemVersion": "12.0"
+      "minimumSystemVersion": "13.3",
+      "signingIdentity": "-",
+      "entitlements": "entitlements.plist"
+    },
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      },
+      "wix": {
+        "template": "wix/main.wxs"
+      }
     }
   },
   "plugins": {
     "updater": {
       "active": true,
       "endpoints": [
-        "https://github.com/debpalash/OmniVoice-Studio/releases/latest/download/latest.json"
+        "https://github.com/debpalash/VoiceStudio/releases/latest/download/latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDhFMDQ1QkZCQ0I4RDlCQkYKUldTL200M0wrMXNFamdPSGF3VkUzVjBRY1FFOE0yTkxSMVZKNUowL2wyZEw2OG1TWXNLMDlSeTQK",
       "dialog": false

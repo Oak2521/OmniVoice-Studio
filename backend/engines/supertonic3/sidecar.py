@@ -137,9 +137,17 @@ def _resolve_pinned_sha() -> str:
         # Final fallback ‑‑ relative import for when the file is invoked
         # via ``python backend/engines/supertonic3/sidecar.py`` rather
         # than via ``python -m backend.engines.supertonic3.sidecar``.
-        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-        from engines.supertonic3.constants import PINNED_REVISION_SHA  # type: ignore[import-not-found]
-        return PINNED_REVISION_SHA
+        # Load constants.py by path. Importing it as `engines.supertonic3…`
+        # runs the package __init__, which imports the app's backend, and that
+        # is absent from the engine's own venv (one-click install).
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "_supertonic3_constants", Path(__file__).resolve().with_name("constants.py"),
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # type: ignore[union-attr]
+        return module.PINNED_REVISION_SHA
 
 
 # ── model loading (lazy, on first synthesize) ─────────────────────────────
@@ -202,10 +210,12 @@ def _wav_float_to_pcm_b64(wav, sample_rate: int) -> tuple[str, int, int]:
     import numpy as np
 
     arr = np.asarray(wav, dtype=np.float32).squeeze()
-    if arr.ndim > 1:
-        # Defensive: downmix to mono in case a future SDK version emits
-        # multi-channel. Mean across the channel dim.
-        arr = arr.mean(axis=0)
+    while arr.ndim > 1:
+        # Downmix along whichever axis is the channel axis. Hardcoded to axis 0
+        # this averaged across TIME for a channels-last (N, 2) array -- every
+        # output sample became the mean of two neighbouring samples, which is
+        # not a downmix but a destroyed waveform. (#1328)
+        arr = arr.mean(axis=int(np.argmin(arr.shape)))
     arr = np.clip(arr, -1.0, 1.0)
     pcm = (arr * 32767.0).astype(np.int16).tobytes()
     return base64.b64encode(pcm).decode("ascii"), int(sample_rate), int(arr.shape[0])
@@ -325,7 +335,24 @@ def main(argv: list[str] | None = None) -> int:
         return _run_selftest()
 
     stdin = sys.stdin.buffer
-    stdout = sys.stdout.buffer
+    # Frames go down a PRIVATE fd, and fd 1 is pointed at stderr (#1428).
+    #
+    # This sidecar's protocol is length-prefixed binary on stdout, but it is
+    # not the only thing writing there: the libraries it loads print freely to
+    # fd 1 — wetextprocessing's FST logs, tqdm bars, native prints from torch
+    # and ONNX runtime. Those bytes interleave with frames, and the parent
+    # then reads four bytes of log text as a length prefix, which is how a
+    # generation dies with `OSError: frame too large: 1044258881` (that number
+    # is ASCII). Worse, it desyncs the stream, so every later request on the
+    # same sidecar reads stale bytes and no retry can recover.
+    #
+    # Duplicating fd 1 first keeps a clean channel only this module can write
+    # to; redirecting fd 1 to fd 2 sends the library noise to stderr, which
+    # the parent already drains into its own log (through the HF-token
+    # redactor). Nothing is lost and the frame stream cannot be corrupted.
+    _frame_fd = os.dup(1)
+    os.dup2(2, 1)
+    stdout = os.fdopen(_frame_fd, "wb")
 
     # Detect SDK version for the ready frame so the parent's compat table
     # can surface it without re-importing the SDK in-process.

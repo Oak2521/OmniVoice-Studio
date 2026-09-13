@@ -14,15 +14,9 @@
  */
 import type { StateCreator } from 'zustand';
 
-export type VDCategory =
-  | 'Gender'
-  | 'Age'
-  | 'Pitch'
-  | 'Style'
-  | 'EnglishAccent'
-  | 'ChineseDialect';
+type VDCategory = 'Gender' | 'Age' | 'Pitch' | 'Style' | 'EnglishAccent' | 'ChineseDialect';
 
-export type VDStates = Record<VDCategory, string>;
+type VDStates = Record<VDCategory, string>;
 
 export interface GenerateSlice {
   // Prompt + source
@@ -46,6 +40,27 @@ export interface GenerateSlice {
   // Voice-design category picks
   vdStates: VDStates;
 
+  // Voice-design seed (#526): the last seed the backend used, and whether to
+  // reuse it on the next synth so voice tweaks stay on the same base timbre.
+  designSeed: number | null;
+  keepSeed: boolean;
+
+  /**
+   * How many synth requests are in flight right now.
+   *
+   * A COUNT, not a flag. Syntheses overlap — the Generate tab, voice previews,
+   * the compare modal, the stories editor and profile previews can all be
+   * running at once, and a boolean would be cleared by whichever finished
+   * first while the others were still going, letting the updater relaunch and
+   * discard them.
+   *
+   * Maintained by `api/generate.ts` around the single `/generate` call every
+   * one of those paths goes through, so a new caller is covered without having
+   * to remember this exists. Read via `utils/appBusy`. Transient: never
+   * persisted, since a synth cannot survive a reload.
+   */
+  ttsInflight: number;
+
   setText: (v: string) => void;
   setRefText: (v: string) => void;
   setInstruct: (v: string) => void;
@@ -63,6 +78,11 @@ export interface GenerateSlice {
   setDuration: (v: string) => void;
 
   setVdStates: (v: VDStates | ((prev: VDStates) => VDStates)) => void;
+
+  setDesignSeed: (v: number | null) => void;
+  setKeepSeed: (v: boolean) => void;
+  /** +1 on synth start, -1 on settle. Floors at 0; never goes negative. */
+  addTtsInflight: (delta: number) => void;
 }
 
 const INITIAL_VD: VDStates = {
@@ -93,23 +113,32 @@ export const createGenerateSlice: StateCreator<GenerateSlice, [], [], GenerateSl
 
   vdStates: INITIAL_VD,
 
-  setText:        (v) => set({ text: v }),
-  setRefText:     (v) => set({ refText: v }),
-  setInstruct:    (v) => set({ instruct: v }),
-  setLanguage:    (v) => set({ language: v }),
+  designSeed: null,
+  keepSeed: false,
+  ttsInflight: 0,
 
-  setSpeed:        (v) => set({ speed: v }),
-  setSteps:        (v) => set({ steps: v }),
-  setCfg:          (v) => set({ cfg: v }),
-  setTShift:       (v) => set({ tShift: v }),
-  setPosTemp:      (v) => set({ posTemp: v }),
-  setClassTemp:    (v) => set({ classTemp: v }),
+  setText: (v) => set({ text: v }),
+  setRefText: (v) => set({ refText: v }),
+  setInstruct: (v) => set({ instruct: v }),
+  setLanguage: (v) => set({ language: v }),
+
+  setSpeed: (v) => set({ speed: v }),
+  setSteps: (v) => set({ steps: v }),
+  setCfg: (v) => set({ cfg: v }),
+  setTShift: (v) => set({ tShift: v }),
+  setPosTemp: (v) => set({ posTemp: v }),
+  setClassTemp: (v) => set({ classTemp: v }),
   setLayerPenalty: (v) => set({ layerPenalty: v }),
-  setDenoise:      (v) => set({ denoise: v }),
-  setPostprocess:  (v) => set({ postprocess: v }),
-  setDuration:     (v) => set({ duration: v }),
+  setDenoise: (v) => set({ denoise: v }),
+  setPostprocess: (v) => set({ postprocess: v }),
+  setDuration: (v) => set({ duration: v }),
 
-  setVdStates: (v) => set((s) => ({
-    vdStates: typeof v === 'function' ? (v as (p: VDStates) => VDStates)(s.vdStates) : v,
-  })),
+  setVdStates: (v) =>
+    set((s) => ({
+      vdStates: typeof v === 'function' ? (v as (p: VDStates) => VDStates)(s.vdStates) : v,
+    })),
+
+  setDesignSeed: (v) => set({ designSeed: v }),
+  setKeepSeed: (v) => set({ keepSeed: v }),
+  addTtsInflight: (delta) => set((st) => ({ ttsInflight: Math.max(0, st.ttsInflight + delta) })),
 });

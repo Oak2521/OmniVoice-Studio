@@ -19,6 +19,10 @@ import pytest
 def fresh_app(monkeypatch, tmp_path):
     """Same isolation pattern as tests/backend/test_engine_spawn_token.py —
     new tmp DB + a fresh settings router instance per test."""
+    from huggingface_hub import constants
+    monkeypatch.setattr(constants, "HF_TOKEN_PATH", str(tmp_path / "hf-token"))
+    monkeypatch.setattr(constants, "HF_STORED_TOKENS_PATH", str(tmp_path / "stored_tokens"))
+    monkeypatch.setenv("HF_TOKEN_PATH", str(tmp_path / "hf-token"))
     monkeypatch.setenv("OMNIVOICE_DATA_DIR", str(tmp_path))
     monkeypatch.delenv("HF_TOKEN", raising=False)
     monkeypatch.delenv("HUGGING_FACE_HUB_TOKEN", raising=False)
@@ -97,6 +101,10 @@ def test_value_round_trips_via_settings_store(fresh_app, monkeypatch):
 
 def test_env_injection_when_enabled_on_windows(monkeypatch, tmp_path):
     """build_engine_env injects TORCH_COMPILE_DISABLE=1 on win32 + flag true."""
+    from huggingface_hub import constants
+    monkeypatch.setattr(constants, "HF_TOKEN_PATH", str(tmp_path / "hf-token"))
+    monkeypatch.setattr(constants, "HF_STORED_TOKENS_PATH", str(tmp_path / "stored_tokens"))
+    monkeypatch.setenv("HF_TOKEN_PATH", str(tmp_path / "hf-token"))
     monkeypatch.setenv("OMNIVOICE_DATA_DIR", str(tmp_path))
     for mod in list(sys.modules):
         if mod == "core" or mod.startswith("core.") or mod == "services" or mod.startswith("services."):
@@ -118,6 +126,10 @@ def test_env_injection_when_enabled_on_windows(monkeypatch, tmp_path):
 
 def test_no_env_injection_on_non_windows(monkeypatch, tmp_path):
     """On macOS/Linux the var is never injected, even when the flag is set."""
+    from huggingface_hub import constants
+    monkeypatch.setattr(constants, "HF_TOKEN_PATH", str(tmp_path / "hf-token"))
+    monkeypatch.setattr(constants, "HF_STORED_TOKENS_PATH", str(tmp_path / "stored_tokens"))
+    monkeypatch.setenv("HF_TOKEN_PATH", str(tmp_path / "hf-token"))
     monkeypatch.setenv("OMNIVOICE_DATA_DIR", str(tmp_path))
     for mod in list(sys.modules):
         if mod == "core" or mod.startswith("core.") or mod == "services" or mod.startswith("services."):
@@ -140,6 +152,10 @@ def test_no_env_injection_on_non_windows(monkeypatch, tmp_path):
 
 def test_no_env_injection_when_disabled(monkeypatch, tmp_path):
     """Flag false on win32 → var not injected."""
+    from huggingface_hub import constants
+    monkeypatch.setattr(constants, "HF_TOKEN_PATH", str(tmp_path / "hf-token"))
+    monkeypatch.setattr(constants, "HF_STORED_TOKENS_PATH", str(tmp_path / "stored_tokens"))
+    monkeypatch.setenv("HF_TOKEN_PATH", str(tmp_path / "hf-token"))
     monkeypatch.setenv("OMNIVOICE_DATA_DIR", str(tmp_path))
     for mod in list(sys.modules):
         if mod == "core" or mod.startswith("core.") or mod == "services" or mod.startswith("services."):

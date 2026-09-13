@@ -1,51 +1,100 @@
-# OmniVoice Studio — CosyVoice Engine
+# VoiceStudio: CosyVoice Engine
 
-CosyVoice is one of the multilingual TTS engines OmniVoice can drive. It does
-zero-shot voice cloning across 9+ languages with separate models for "base",
-"instruct", and "SFT" use cases.
+CosyVoice is an optional multilingual TTS backend for zero-shot voice cloning
+and instructed speech. A one-click install runs it in its own
+environment and process; an existing source installation keeps
+running in-process.
 
-## Install
+## Downloaded weights and an available engine are different states
 
-CosyVoice is installed *per-engine* from the in-app **Settings → Engines** tab:
+The Model Catalogue tracks model weights separately from engine runtime
+availability. A downloaded
+`FunAudioLLM/Fun-CosyVoice3-0.5B-2512` cache means the model files reached the
+machine. It does not prove that the VoiceStudio backend can import and run
+CosyVoice.
 
-1. Open **Settings → Engines**.
-2. Click **Install** next to "CosyVoice".
-3. The app fetches the engine source, creates a dedicated venv, syncs deps,
-   and downloads model weights (~2 GB).
-4. Once installed, the engine appears in the **Voice Cloning** and
-   **Voice Design** engine picker dropdowns.
+The current readiness check requires the same Python interpreter that runs the
+VoiceStudio backend to import:
 
-The dedicated venv keeps CosyVoice's transformer pins from clashing with
-IndexTTS / ChatterboxTTS / SonicTranslate (see
-[troubleshooting.md](../install/troubleshooting.md#10-indextts--cosyvoice--chatterboxtts-clash)).
+```python
+from cosyvoice.cli.cosyvoice import AutoModel
+```
 
-## Common errors
+It then loads the directory named by `OMNIVOICE_COSYVOICE_MODEL`, or defaults
+to `pretrained_models/Fun-CosyVoice3-0.5B`. That path must resolve to the usable
+model directory, not only the parent Hugging Face cache directory.
 
-### `Model not found: CosyVoice-300M-Instruct`
+## One-click install
 
-The first synthesis call downloads the weights from HuggingFace. If the
-download was interrupted, the manifest can be inconsistent. **Fix:** delete
-`~/.cache/huggingface/hub/models--FunAudioLLM--CosyVoice-300M*` and retry —
-the engine re-downloads cleanly.
+Click **Install** in **Model Catalogue → Engines → CosyVoice**. VoiceStudio
+gives CosyVoice its own folder under the data directory and its own Python
+3.10 environment, and runs it there in a separate process. The install:
 
-### `HfHubHTTPError: 401 Client Error`
+- clones a reviewed CosyVoice commit and the Matcha-TTS code it depends on;
+- downloads the CosyVoice 3 weights (about 5.4 GB).
 
-CosyVoice models are not gated as of `v1.x`, but the underlying download
-goes through `huggingface_hub` which still wants a token for rate-limit
-buckets. Set one — see
-[docs/setup/huggingface-token.md](../setup/huggingface-token.md).
+It differs from upstream's own setup:
 
-### `RuntimeError: CUDA out of memory` on first synthesise
+- **PyTorch 2.7.0.** The CUDA 12.8 build on an NVIDIA GPU, the CPU build on
+  other Windows and Linux machines, the regular build on Apple Silicon.
+  Upstream's 2.3.1 exists only for CUDA 12.1 and cannot run on RTX 50-series
+  GPUs.
+- **Leaner dependencies.** No TensorRT, DeepSpeed or GPU onnxruntime, and no
+  third-party package index. Upstream uses them for extra speed on Linux;
+  synthesis works without them. Nothing needs a compiler, and SoX is not
+  needed.
+- **Patched dependencies.** Where upstream pins a release with a published
+  security advisory (diffusers, hydra-core, lightning, modelscope, onnx,
+  protobuf, transformers), the install uses the fixed release. That set was
+  installed on Windows and passes the install's import check.
+- **No text normaliser.** Upstream's (wetext) downloads its data from
+  ModelScope on every model load, and ModelScope rate-limits those
+  downloads, so a normaliser could half-download and fail silently. The
+  one-click install leaves it out, and CosyVoice reads text as written:
+  spell out numbers, dates and symbols where the pronunciation matters.
+- **Only the weights CosyVoice 3 loads.** Not the RL and TensorRT variants
+  that share its repository.
 
-The CosyVoice-300M-Instruct path peaks at ~4.5 GB VRAM. If you're on an 8 GB
-GPU and also have a browser open, that's tight. **Fix:** close other CUDA
-apps, or pick a smaller variant (CosyVoice-300M without instruct).
+Nothing it installs touches VoiceStudio itself or any other engine, and
+**Uninstall** in the same row removes only that folder. An existing source
+installation keeps working as it is. The button is not offered on Intel
+Macs, where PyTorch 2.7.0 has no build.
 
-## Troubleshooting
+CosyVoice 3 has no built-in voices. With no reference clip, it speaks in the
+voice of upstream's own sample prompt.
 
-- **Issue [#55](https://github.com/debpalash/OmniVoice-Studio/issues/55):**
-  CosyVoice install clashing with IndexTTS — fixed in v0.3+ via per-engine
-  venvs.
-- For other errors, capture the splash-screen log (Settings → Logs → Backend)
-  and open a bug report with **Settings → Help → Report a bug** (Phase 5
-  ships the auto-report path).
+## Source builds and existing installations
+
+The upstream CosyVoice project recommends its own Python 3.10 Conda environment
+and SoX. The one-click install above gives CosyVoice that separate
+environment. Installing upstream dependency pins into VoiceStudio's
+shared backend environment can also conflict with other engines.
+
+Existing source installations remain usable when the VoiceStudio backend's
+interpreter can already import `cosyvoice.cli.cosyvoice.AutoModel`. Keep a
+working installation in place. Before starting VoiceStudio, set
+`OMNIVOICE_COSYVOICE_MODEL` to its usable model directory through the source
+checkout's environment or project `.env` file.
+
+For upstream setup details, read the
+[official CosyVoice installation guide](https://github.com/QwenAudio/CosyVoice#install).
+Those steps create a standalone CosyVoice environment. They do not turn the
+current packaged VoiceStudio app into a CosyVoice installer.
+
+## Diagnose an unavailable engine
+
+Include these facts in a support question or bug report:
+
+1. The exact VoiceStudio version.
+2. The full reason under **Model Catalogue > Engines > CosyVoice** after
+   selecting **Re-check**.
+3. The CosyVoice lines from **Settings > Logs > Backend** immediately after
+   that check.
+4. On Windows, the output of `where.exe sox` in PowerShell.
+
+These facts distinguish a downloaded-model state from a missing Python runtime,
+missing SoX executable, or incorrect model directory. Do not delete a model
+cache or reinstall dependencies until the log identifies which state failed.
+
+The public report that exposed the misleading installed state is
+[Discussion 1631](https://github.com/debpalash/VoiceStudio/discussions/1631).

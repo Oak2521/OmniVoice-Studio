@@ -38,6 +38,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
+import time
 from typing import Iterable, Optional
 
 logger = logging.getLogger("omnivoice.translator")
@@ -59,8 +61,9 @@ _ADAPT_PROMPT = """\
 You are a cinematic dubbing writer. Rewrite the literal translation using the
 editor's critique so it sounds natural, in-character, and fits the speaker's
 time slot. Keep meaning faithful but prefer native idiom over word-for-word
-accuracy. The output MUST be written in the same target language and script
-as the literal translation — never switch language or transliterate.
+accuracy. Never introduce facts, names, or dialogue that are not present in
+the source line. The output MUST be written in the same target language and
+script as the literal translation — never switch language or transliterate.
 Reply ONLY with the adapted translation — no quotes, no headers, no code
 fences, no commentary."""
 
@@ -93,28 +96,138 @@ def _looks_like_target_script(text: str, code: str, threshold: float = 0.5) -> b
     return (inside / len(letters)) >= threshold
 
 
-def _llm_client():
-    """Lazy-build the OpenAI-compatible client. Returns None if no key + no local base_url."""
+# ── Divergence guard (shared with speech_rate's Autofit fit pass) ────────────
+# For every Latin-script target `_looks_like_target_script` passes ANY text
+# unconditionally (no `_SCRIPT_RANGES` entry), so it was the only — and for
+# es/de/fr/… a no-op — gate on the ADAPT/fit LLM output. These checks close
+# that gap for the whole class: runaway length (hallucinated dialogue,
+# refusals, commentary) and the REFLECT critique echoed back as the "line".
+
+_SHORT_REF_CHARS = 20        # below this, a length *ratio* is meaningless
+_SHORT_REF_ABS_SLACK = 120   # …use an absolute cap instead: ref + this many chars
+
+
+def _refine_ratio_bounds() -> tuple[float, float]:
+    """Accepted ``len(candidate)/len(reference)`` window for LLM refine output.
+    Anything outside is treated as divergence and the caller degrades to its
+    input text. Defaults [0.4, 2.5]; env-tunable like the cinematic budget."""
     try:
-        from openai import OpenAI
-    except ImportError:
-        logger.warning("openai package not installed — cinematic mode unavailable.")
-        return None
-    base_url = os.environ.get("TRANSLATE_BASE_URL")
-    api_key = (
-        os.environ.get("TRANSLATE_API_KEY")
-        or os.environ.get("OPENAI_API_KEY")
-        or ("local" if base_url else None)  # local providers often accept any key
-    )
-    if not api_key:
-        return None
-    kw = {"api_key": api_key}
-    if base_url:
-        kw["base_url"] = base_url
-    return OpenAI(**kw)
+        lo = float(os.environ.get("OMNIVOICE_REFINE_RATIO_MIN", "0.4"))
+    except ValueError:
+        lo = 0.4
+    try:
+        hi = float(os.environ.get("OMNIVOICE_REFINE_RATIO_MAX", "2.5"))
+    except ValueError:
+        hi = 2.5
+    return lo, hi
+
+
+def _norm_overlap_text(s: str) -> str:
+    return " ".join(s.lower().split())
+
+
+def _echoes_critique(candidate: str, critique: str) -> bool:
+    """True when the "adaptation" is really the REFLECT critique leaking through.
+
+    Deterministic on purpose (no fuzzy matching): exact match after
+    case/whitespace normalization; containment — the full critique inside the
+    candidate always counts, the candidate inside the critique only when it
+    covers most of it (critiques legitimately quote short phrases from the
+    line); or >0.8 token-set overlap.
+    """
+    c = _norm_overlap_text(candidate)
+    k = _norm_overlap_text(critique)
+    if not c or not k:
+        return False
+    if c == k:
+        return True
+    if k in c:                                  # critique embedded in the output
+        return True
+    if c in k and len(c) >= 0.6 * len(k):       # output ≈ a big chunk of the critique
+        return True
+    ct, kt = set(c.split()), set(k.split())
+    union = ct | kt
+    return bool(union) and len(ct & kt) / len(union) > 0.8
+
+
+def refine_output_ok(
+    reference: str,
+    candidate: str,
+    target_lang: str,
+    *,
+    critique: str | None = None,
+    max_ratio: float | None = None,
+) -> tuple[bool, str | None]:
+    """Sanity-check one LLM refine output against the text it was rewriting.
+
+    Shared by the Cinematic ADAPT step here and by ``speech_rate``'s Autofit
+    fit pass (speech_rate imports this; translator never imports speech_rate,
+    so there is no cycle). Returns ``(ok, reason)`` — ``reason`` is ``None``
+    when ok, otherwise a short machine-readable tag for logs/error mapping.
+
+    Checks, in order:
+      • script — candidate must look like the target language's script
+        (``_looks_like_target_script``; Latin-script targets pass, as before);
+      • length — ``len(candidate)/len(reference)`` must sit inside
+        [``OMNIVOICE_REFINE_RATIO_MIN``, ``OMNIVOICE_REFINE_RATIO_MAX``]
+        (default 0.4–2.5; ``max_ratio`` overrides the upper bound). References
+        shorter than ~20 chars use an absolute cap (reference + 120 chars)
+        instead — a two-word line legitimately doubles or halves;
+      • critique echo — the candidate must not be the critique itself.
+    """
+    cand = (candidate or "").strip()
+    ref = (reference or "").strip()
+    if not cand:
+        return False, "empty"
+    if not _looks_like_target_script(cand, target_lang):
+        return False, f"wrong-script:{target_lang}"
+    lo, hi = _refine_ratio_bounds()
+    if max_ratio is not None:
+        hi = max_ratio
+    if ref:
+        if len(ref) < _SHORT_REF_CHARS:
+            if len(cand) > len(ref) + _SHORT_REF_ABS_SLACK:
+                return False, f"length-abs:{len(cand)}>{len(ref)}+{_SHORT_REF_ABS_SLACK}"
+        else:
+            ratio = len(cand) / len(ref)
+            if not (lo <= ratio <= hi):
+                return False, f"length-ratio:{ratio:.2f}"
+    if critique and _echoes_critique(cand, critique):
+        return False, "critique-echo"
+    return True, None
+
+
+# The LLM Skills registry entry this pipeline resolves through — lets the
+# user disable Cinematic/Autofit's LLM use or route it to a specific provider
+# (Settings → LLM Skills) independently of the other LLM features.
+_SKILL_ID = "cinematic_translation"
+
+
+def _llm_client():
+    """Lazy-build the OpenAI-compatible client for the Cinematic skill.
+
+    Resolves through the LLM Skills registry: per-skill provider override →
+    global active provider (Settings → LLM Providers). The registry's
+    ``custom`` provider still maps ``TRANSLATE_BASE_URL``/``TRANSLATE_API_KEY``,
+    so legacy env setups keep working. Returns None if the skill is disabled
+    or no provider is configured — the callers' Fast-fallback path.
+
+    The registry builds the client with ``max_retries=0`` (see
+    ``llm_skills.resolve_skill_client``) so a 429 + long Retry-After can't make
+    one call sleep+retry past the cinematic wall-clock budget from inside a
+    single request. The pass-level budget (``cinematic_refine_many``) and the
+    per-call timeout stay the only bounds.
+    """
+    from services import llm_skills
+    handle = llm_skills.resolve_skill_client(_SKILL_ID)
+    return handle.client if handle is not None else None
 
 
 def _llm_model() -> str:
+    from services import llm_providers, llm_skills
+    p = llm_skills.effective_provider(_SKILL_ID)
+    if p is not None:
+        return llm_providers.resolve_model(p)
     return os.environ.get("TRANSLATE_MODEL", "gpt-4o-mini")
 
 
@@ -123,6 +236,16 @@ def _llm_timeout() -> float:
         return float(os.environ.get("OMNIVOICE_LLM_TIMEOUT", "45"))
     except ValueError:
         return 45.0
+
+
+def _cinematic_budget() -> float:
+    """Overall wall-clock cap for a whole cinematic/autofit refine pass (seconds).
+    Unfinished segments degrade to their literal (Fast) translation once hit, so
+    a slow provider can't hang the translate. Default 180s; <=0 disables."""
+    try:
+        return float(os.environ.get("OMNIVOICE_CINEMATIC_BUDGET_S", "180"))
+    except ValueError:
+        return 180.0
 
 
 def _glossary_text(glossary: Iterable[dict] | None) -> str:
@@ -149,17 +272,62 @@ def _glossary_text(glossary: Iterable[dict] | None) -> str:
     )
 
 
+#: Longest Retry-After we'll honor with an in-place wait. Anything above this
+#: means "the provider is down for a while" — fail fast and let the segment
+#: degrade to its literal translation instead of stalling the whole dub.
+_RETRY_AFTER_CAP_S = 30.0
+
+
+def _retry_after_seconds(exc) -> float | None:
+    """Retry-After from a rate-limit error, or None when this isn't a 429.
+
+    Providers frequently 429 with a *tiny* hint (OpenRouter's free pool says
+    "Retry-After: 2"); giving up instantly on those turned a two-second wait
+    into a whole failed reflect pass — 6 segments fire concurrently, so one
+    throttle window used to take out every segment at once. Defensive on
+    purpose: the exception shape differs across openai-lib versions and
+    OpenAI-compatible servers, and a parsing surprise must never break the
+    caller's own error handling.
+    """
+    try:
+        if getattr(exc, "status_code", None) != 429:
+            return None
+        headers = getattr(getattr(exc, "response", None), "headers", None) or {}
+        raw = headers.get("retry-after") or headers.get("Retry-After")
+        seconds = float(raw) if raw is not None else 2.0
+        return max(0.5, min(seconds, _RETRY_AFTER_CAP_S))
+    except Exception:  # noqa: BLE001 — a weird header is not worth a crash
+        return None
+
+
 def _chat(client, *, system: str, user: str) -> str:
-    """One-shot chat completion. Raises on failure."""
-    res = client.chat.completions.create(
-        model=_llm_model(),
-        timeout=_llm_timeout(),
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-    )
-    return (res.choices[0].message.content or "").strip()
+    """One-shot chat completion. Raises on failure.
+
+    One polite retry on a rate limit: when the provider sends a 429 with a
+    bounded Retry-After, wait it out once (plus jitter so the 6-wide
+    concurrent segment fan-out doesn't re-stampede the same window) and try
+    again. A second 429 propagates — the caller degrades to the literal text.
+    """
+    attempts = 0
+    while True:
+        try:
+            res = client.chat.completions.create(
+                model=_llm_model(),
+                timeout=_llm_timeout(),
+                temperature=0.2,  # pinned like the Fast path — default 1.0 drifts/invents
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            )
+            return (res.choices[0].message.content or "").strip()
+        except Exception as e:  # noqa: BLE001 — re-raised unless a retryable 429
+            wait = _retry_after_seconds(e)
+            if wait is None or attempts >= 1:
+                raise
+            attempts += 1
+            logger.info("LLM rate-limited; honoring Retry-After=%.1fs (one retry)", wait)
+            time.sleep(wait + random.uniform(0.1, 1.0))
 
 
 # ── Public API ──────────────────────────────────────────────────────────────
@@ -178,6 +346,7 @@ def cinematic_refine_sync(
     target_lang: str,
     glossary: Iterable[dict] | None = None,
     direction: Optional[str] = None,
+    dialect_hint: Optional[str] = None,
 ) -> dict:
     """Blocking: run REFLECT + ADAPT on a single segment.
 
@@ -197,7 +366,7 @@ def cinematic_refine_sync(
 
     client = _llm_client()
     if client is None:
-        return {**result_ok, "error": "no-llm"}
+        return {**result_ok, "degraded": "no-llm"}
 
     glossary_preamble = _glossary_text(glossary)
 
@@ -219,6 +388,10 @@ def cinematic_refine_sync(
             out = out + "\n\n" + glossary_preamble
         if direction_hint:
             out = out + "\n\nDirection: " + direction_hint
+        # #280 item 2 — regional dialect/vocabulary hint (e.g. Argentinian
+        # voseo). Caller builds the clause; we just ride it on both prompts.
+        if dialect_hint and dialect_hint.strip():
+            out = out + "\n\nDialect: " + dialect_hint.strip()
         return out
 
     # Step 2 — reflect
@@ -230,7 +403,7 @@ def cinematic_refine_sync(
         critique = _chat(client, system=_with_preamble(_REFLECT_PROMPT), user=reflect_user)
     except Exception as e:
         logger.warning("cinematic reflect failed: %s", e)
-        return {**result_ok, "error": f"reflect: {e}"}
+        return {**result_ok, "degraded": f"reflect: {e}"}
 
     # Step 3 — adapt
     try:
@@ -246,25 +419,32 @@ def cinematic_refine_sync(
             "text": literal_text,
             "literal": literal_text,
             "critique": critique,
-            "error": f"adapt: {e}",
+            "degraded": f"adapt: {e}",
         }
 
     final = (adapted or "").strip() or literal_text
-    # Refuse adaptations that drifted off the target script (e.g. local LLM
-    # rewrote a Devanagari line in Latin/German). Caller still gets the
-    # critique so the UI can show what happened, but the live text falls
-    # back to the literal translation rather than corrupting the dub.
-    if final is not literal_text and not _looks_like_target_script(final, target_lang):
-        logger.warning(
-            "cinematic adapt produced wrong-script output for %s — falling back to literal",
-            target_lang,
-        )
-        return {
-            "text": literal_text,
-            "literal": literal_text,
-            "critique": critique,
-            "error": f"adapt-wrong-script:{target_lang}",
-        }
+    # Refuse adaptations that diverged from the line they were rewriting:
+    # wrong script (e.g. a local LLM rewrote a Devanagari line in
+    # Latin/German), runaway length (hallucinated dialogue, refusals,
+    # commentary — the script check alone passes ANY text for Latin-script
+    # targets), or the critique echoed back as the "adaptation". Caller still
+    # gets the critique so the UI can show what happened, but the live text
+    # falls back to the literal translation rather than corrupting the dub.
+    if final is not literal_text:
+        ok, reason = refine_output_ok(literal_text, final, target_lang, critique=critique)
+        if not ok:
+            logger.warning(
+                "cinematic adapt diverged for %s (%s) — falling back to literal",
+                target_lang, reason,
+            )
+            wrong_script = (reason or "").startswith("wrong-script")
+            return {
+                "text": literal_text,
+                "literal": literal_text,
+                "critique": critique,
+                "degraded": (f"adapt-wrong-script:{target_lang}" if wrong_script
+                             else "adapt-diverged"),
+            }
     return {
         "text": final,
         "literal": literal_text,
@@ -279,6 +459,7 @@ async def cinematic_refine_many(
     target_lang: str,
     glossary: Iterable[dict] | None = None,
     directions: Optional[dict[str, str]] = None,
+    dialect_hint: Optional[str] = None,
     executor=None,
     concurrency: int | None = None,
 ) -> list[dict]:
@@ -288,6 +469,8 @@ async def cinematic_refine_many(
     `directions`: optional `{seg_id: "natural-language direction"}` — when
         present, the matching segment's reflect/adapt prompts get the parsed
         direction hint prepended.
+    `dialect_hint`: optional regional-dialect clause (#280) applied to every
+        segment's reflect/adapt prompts.
     Returns a list of dicts keyed the same length + order, each carrying
     `id`, `text`, `literal`, `critique`, optional `error`.
     """
@@ -307,8 +490,45 @@ async def cinematic_refine_many(
                     target_lang=target_lang,
                     glossary=glossary,
                     direction=directions.get(seg_id),
+                    dialect_hint=dialect_hint,
                 ),
             )
         return {"id": seg_id, **res}
 
-    return await asyncio.gather(*(_one(sid, src, lit) for sid, src, lit in pairs))
+    # Overall wall-clock budget for the whole pass. Per-call timeout + bounded
+    # concurrency already cap it, but a slow/rate-limited provider on a large dub
+    # can still stall the "Translating…" spinner for minutes. Bound it: segments
+    # that finish in time keep their cinematic refine; any still-running segment
+    # degrades to its literal (Fast) translation so the translate ALWAYS returns
+    # within the budget instead of hanging. 0/negative disables the bound.
+    budget = _cinematic_budget()
+    tasks = [asyncio.ensure_future(_one(sid, src, lit)) for sid, src, lit in pairs]
+    if budget <= 0:
+        return await asyncio.gather(*tasks)
+
+    done, pending = await asyncio.wait(tasks, timeout=budget)
+    if pending:
+        logger.warning(
+            "Cinematic pass hit its %.0fs budget with %d/%d segment(s) unfinished "
+            "— falling back to the literal translation for those (slow LLM "
+            "provider?). Raise OMNIVOICE_CINEMATIC_BUDGET_S or pick a faster "
+            "provider.", budget, len(pending), len(tasks),
+        )
+    out: list[dict] = []
+    for task, (sid, _src, lit) in zip(tasks, pairs):
+        if task in done and not task.cancelled():
+            try:
+                out.append(task.result())
+                continue
+            except Exception as e:  # noqa: BLE001 — never let one seg sink the pass
+                logger.warning("cinematic segment %s failed: %s", sid, e)
+        else:
+            task.cancel()  # stop awaiting; the executor thread is abandoned (#730 pattern)
+        # "degraded", not "error": the literal translation is used, so the
+        # segment is fully usable — downstream passes (speech-rate fit,
+        # duration planning) must still run on it, and the UI must not count
+        # it as a failed segment. `error` is reserved for rows with no usable
+        # text at all (the base translation itself failed).
+        out.append({"id": sid, "text": lit, "literal": lit, "critique": "",
+                    "degraded": "cinematic-budget"})
+    return out

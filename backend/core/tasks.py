@@ -5,6 +5,7 @@ import logging
 
 from core import job_store
 from core import failure
+from core import run_sentinel
 
 logger = logging.getLogger("omnivoice.tasks")
 
@@ -107,6 +108,11 @@ class TaskManager:
                 job_store.mark_running(task_id)
             except Exception:
                 logger.exception("job_store.mark_running failed (non-fatal)")
+            # Crash forensics (#1164): note what kind of work just started so
+            # an unclean process death (OOM kill mid-dub, …) can be attributed
+            # by the next run. Task TYPE only — never user content. The touch
+            # is throttled + exception-safe by contract (core.run_sentinel).
+            run_sentinel.touch_activity("task", t.get("type"))
             try:
                 import inspect
                 res = func(*args, **kwargs)

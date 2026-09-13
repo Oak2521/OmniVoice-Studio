@@ -4,7 +4,7 @@ Resolution priority (highest → lowest):
 
   1. app    — `settings_store.get_hf_token()` (encrypted in SQLite)
   2. env    — `HF_TOKEN` or the legacy `HUGGING_FACE_HUB_TOKEN` env var
-  3. hf-cli — `huggingface_hub.get_token()` (canonical ~/.cache/huggingface/token)
+  3. hf-cli — the selected local Hub token file (`HF_TOKEN_PATH`)
 
 For each candidate, the resolver calls `huggingface_hub.whoami(token=...)`
 to verify the token is live; any HTTP error (401, 403, network) skips to
@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+from pathlib import Path
 import threading
 import time
 from dataclasses import dataclass
@@ -30,7 +31,7 @@ logger = logging.getLogger("omnivoice.token_resolver")
 Source = Literal["app", "env", "hf-cli"]
 _PRIORITY: tuple[Source, ...] = ("app", "env", "hf-cli")
 
-_CACHE_TTL_SECONDS = 300.0  # See Open Question #4 — UI "Test now" calls invalidate.
+_CACHE_TTL_SECONDS = 300.0  # UI "Test now" busts it via GET /hf-token/state?fresh=1.
 
 
 @dataclass(frozen=True)
@@ -46,7 +47,7 @@ class SourceState:
     set: bool
     masked: Optional[str]
     whoami_user: Optional[str]
-    whoami_ok: bool
+    whoami_ok: Optional[bool]
 
 
 # ── module-level cache ────────────────────────────────────────────────────
@@ -57,7 +58,8 @@ _CACHE_LOCK = threading.Lock()
 
 def invalidate_cache() -> None:
     """Drop the whoami validation cache. Called by the Settings UI "Test now"
-    button (Plan 01-02) and by save/clear API endpoints (Task 3)."""
+    button (GET /api/settings/hf-token/state?fresh=1), by save/clear API
+    endpoints, and by on_401()."""
     with _CACHE_LOCK:
         _VALIDATION_CACHE.clear()
 
@@ -78,19 +80,26 @@ def _read_app() -> Optional[str]:
         return None
 
 
+def _clean_token(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    return value.replace("\r", "").replace("\n", "").strip() or None
+
+
 def _read_env() -> Optional[str]:
     # HF docs explicitly accept either name; user may have either exported.
     val = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-    return val or None
+    return _clean_token(val)
 
 
 def _read_hf_cli() -> Optional[str]:
     try:
-        import huggingface_hub
-        tok = huggingface_hub.get_token()
-        return tok or None
+        from huggingface_hub import constants
+        return _clean_token(Path(constants.HF_TOKEN_PATH).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
     except Exception:
-        logger.exception("huggingface_hub.get_token failed")
+        logger.warning("Could not read the local Hugging Face token file")
         return None
 
 
@@ -183,17 +192,17 @@ def on_401(active_source: Source) -> Optional[ResolvedToken]:
     return resolve(skip=frozenset({active_source}))
 
 
-def state() -> dict:
+def state(*, validate: bool = False) -> dict:
     """Return one SourceState per priority position so the Settings UI can
     render the cascade table. Includes a masked token + whoami result;
-    never includes the raw token."""
+    never includes the raw token. Reads are local unless validation is explicitly requested."""
     rows: list[SourceState] = []
     active: Optional[Source] = None
     for source in _PRIORITY:
         token = _READERS[source]()
         if token:
-            username = _validate(source, token)
-            ok = username is not None
+            username = _validate(source, token) if validate else None
+            ok = (username is not None) if validate else None
             rows.append(SourceState(
                 source=source,
                 set=True,
@@ -248,15 +257,30 @@ def save_app_token(token: str) -> None:
     invalidate_cache()
 
 
+def clear_hf_cli_tokens() -> None:
+    """Remove recognized Hub token files without refreshing or revoking tokens."""
+    from core.config import HF_CLI_TOKEN_PATHS
+    from huggingface_hub import constants
+
+    # Hub's active path remains authoritative if imported before app config.
+    paths = set(HF_CLI_TOKEN_PATHS) | {constants.HF_TOKEN_PATH}
+    failed = False
+    for token_path in paths:
+        path = Path(token_path)
+        for target in (path, path.parent / "stored_tokens"):
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                failed = True
+    invalidate_cache()
+    if failed:
+        raise OSError("Could not clear all local Hugging Face token files")
+
+
 def clear_app_token(also_clear_hf_cli: bool = False) -> None:
-    """Remove from the encrypted settings store; optionally also call
-    `huggingface_hub.logout()` to clear the canonical HF file."""
+    """Clear the encrypted app token, optionally recognized local Hub files."""
     from services import settings_store
     settings_store.clear_hf_token()
     if also_clear_hf_cli:
-        try:
-            import huggingface_hub
-            huggingface_hub.logout()
-        except Exception:
-            logger.exception("huggingface_hub.logout failed (non-fatal)")
+        clear_hf_cli_tokens()
     invalidate_cache()

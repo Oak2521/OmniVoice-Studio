@@ -1,7 +1,7 @@
 """SoniTranslate sidecar integration.
 
 Manages an isolated SoniTranslate instance that runs as a Gradio service
-on port 7860. OmniVoice calls it via `gradio_client` for full-pipeline
+on port 7860. VoiceStudio calls it via `gradio_client` for full-pipeline
 video dubbing with access to Edge TTS, Piper, Coqui XTTS, and RVC.
 """
 
@@ -15,10 +15,12 @@ from pathlib import Path
 from typing import Optional
 
 from services.ffmpeg_utils import spawn_subprocess
+from core.logging_utils import log_safe
+from core.path_security import UnsafePath, resolve_within, safe_filename
 
 logger = logging.getLogger("omnivoice.sonitranslate")
 
-# Default install location — inside the OmniVoice project tree
+# Default install location — inside the VoiceStudio project tree
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 SONI_DIR = _PROJECT_ROOT / "engines" / "sonitranslate"
 SONI_VENV = SONI_DIR / ".venv"
@@ -227,7 +229,7 @@ async def dub_video(
             "gradio_client not installed. Run: pip install gradio_client"
         )
 
-    logger.info("Submitting dub job to SoniTranslate: %s → %s", video_path, target_language)
+    logger.info("Submitting dub job to SoniTranslate (target=%s)", log_safe(target_language))
 
     client = Client(SONI_URL)
 
@@ -308,11 +310,18 @@ async def dub_video(
         output_file = result
 
     if output_file and output_dir:
-        dest = os.path.join(output_dir, os.path.basename(output_file))
-        shutil.copy2(output_file, dest)
-        output_file = dest
+        output_root = Path(output_dir).expanduser()
+        if not output_root.is_absolute() or not output_root.is_dir():
+            raise ValueError("output_dir must be an existing absolute directory")
+        try:
+            output_name = safe_filename(os.path.basename(output_file))
+            dest = resolve_within(output_root, output_name)
+        except UnsafePath as exc:
+            raise ValueError("SoniTranslate returned an invalid output filename") from exc
+        shutil.copy2(output_file, str(dest))
+        output_file = str(dest)
 
-    logger.info("SoniTranslate dub complete: %s", output_file)
+    logger.info("SoniTranslate dub completed")
     return {
         "output_file": output_file,
         "target_language": target_language,

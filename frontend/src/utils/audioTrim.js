@@ -4,20 +4,23 @@ export function clamp(v, lo, hi) {
   return Math.max(lo, Math.min(hi, v));
 }
 
-export function encodeWav(samples, sampleRate) {
+export function encodeWav(samples, sampleRate, channels = 1) {
+  const channelCount = Math.max(1, Math.min(2, Number(channels) || 1));
   const buf = new ArrayBuffer(44 + samples.length * 2);
   const view = new DataView(buf);
-  const writeStr = (off, s) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); };
+  const writeStr = (off, s) => {
+    for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i));
+  };
   writeStr(0, 'RIFF');
   view.setUint32(4, 36 + samples.length * 2, true);
   writeStr(8, 'WAVE');
   writeStr(12, 'fmt ');
   view.setUint32(16, 16, true);
   view.setUint16(20, 1, true);
-  view.setUint16(22, 1, true);
+  view.setUint16(22, channelCount, true);
   view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * 2, true);
-  view.setUint16(32, 2, true);
+  view.setUint32(28, sampleRate * channelCount * 2, true);
+  view.setUint16(32, channelCount * 2, true);
   view.setUint16(34, 16, true);
   writeStr(36, 'data');
   view.setUint32(40, samples.length * 2, true);
@@ -36,13 +39,17 @@ export function computePeaksFromChannel(channel, buckets = DEFAULT_PEAK_BUCKETS)
   for (let b = 0; b < eff; b++) {
     const s = Math.floor(b * step);
     const e = Math.min(n, Math.floor((b + 1) * step));
-    let mn = 1, mx = -1;
+    let mn = 1,
+      mx = -1;
     for (let i = s; i < e; i++) {
       const v = channel[i];
       if (v < mn) mn = v;
       if (v > mx) mx = v;
     }
-    if (mx < mn) { mn = 0; mx = 0; }
+    if (mx < mn) {
+      mn = 0;
+      mx = 0;
+    }
     peaks[b * 2] = mn;
     peaks[b * 2 + 1] = mx;
   }
@@ -136,13 +143,17 @@ export async function computePeaksAsync(channel, buckets = DEFAULT_PEAK_BUCKETS,
   for (let b = 0; b < eff; b++) {
     const s = Math.floor(b * step);
     const e = Math.min(n, Math.floor((b + 1) * step));
-    let mn = 1, mx = -1;
+    let mn = 1,
+      mx = -1;
     for (let i = s; i < e; i++) {
       const v = channel[i];
       if (v < mn) mn = v;
       if (v > mx) mx = v;
     }
-    if (mx < mn) { mn = 0; mx = 0; }
+    if (mx < mn) {
+      mn = 0;
+      mx = 0;
+    }
     peaks[b * 2] = mn;
     peaks[b * 2 + 1] = mx;
     if ((b & (YIELD_EVERY - 1)) === 0) {
@@ -155,14 +166,33 @@ export async function computePeaksAsync(channel, buckets = DEFAULT_PEAK_BUCKETS,
   return peaks;
 }
 
-export async function probeDuration(file) {
+async function probeDuration(file) {
   return new Promise((resolve, reject) => {
     const url = URL.createObjectURL(file);
     const a = new Audio();
     a.preload = 'metadata';
-    const cleanup = () => { try { URL.revokeObjectURL(url); } catch {} };
-    a.addEventListener('loadedmetadata', () => { const d = a.duration; cleanup(); resolve(isFinite(d) ? d : 0); }, { once: true });
-    a.addEventListener('error', () => { cleanup(); reject(new Error('metadata failed')); }, { once: true });
+    const cleanup = () => {
+      try {
+        URL.revokeObjectURL(url);
+      } catch {}
+    };
+    a.addEventListener(
+      'loadedmetadata',
+      () => {
+        const d = a.duration;
+        cleanup();
+        resolve(isFinite(d) ? d : 0);
+      },
+      { once: true },
+    );
+    a.addEventListener(
+      'error',
+      () => {
+        cleanup();
+        reject(new Error('metadata failed'));
+      },
+      { once: true },
+    );
     a.src = url;
   });
 }
@@ -175,6 +205,33 @@ export async function decodeToMonoLowRate(file, targetSR = 22050) {
   const offline = new Offline(1, len, targetSR);
   const buf = await offline.decodeAudioData(arr);
   return buf;
+}
+
+// Playhead position for a selection [startSec, endSec] that has been playing
+// for `elapsedSec`, measured on the SAME decoded-buffer timeline the waveform
+// and the exported slice use. Kept pure so the preview and the export can never
+// drift onto different timelines again (#1210). Looping wraps within the
+// selection; non-looping clamps at the selection end.
+export function selectionPlayhead(startSec, endSec, elapsedSec, loop) {
+  const seg = Math.max(1e-6, endSec - startSec);
+  const e = Math.max(0, elapsedSec);
+  if (loop) return startSec + (e % seg);
+  return Math.min(endSec, startSec + e);
+}
+
+// Loop window for a BufferSource previewing selection [startSec, endSec] of a
+// `durationSec`-long buffer. A plain canvas click anchors a fresh selection with
+// start === end; if a loop source is started with loopStart === loopEnd (or an
+// inverted range), the Web Audio node IGNORES the loop points and loops the
+// WHOLE buffer — the preview≠selection failure #1210 exists to prevent. Floor
+// the segment at MIN_LOOP_SEC so loopStart < loopEnd always holds, and clamp the
+// window into the buffer. Pure so the guarantee is unit-tested, not eyeballed.
+export const MIN_LOOP_SEC = 0.01;
+export function loopWindow(startSec, endSec, durationSec) {
+  const start = clamp(startSec, 0, Math.max(0, durationSec));
+  const seg = Math.max(MIN_LOOP_SEC, endSec - start);
+  const loopEnd = Math.min(durationSec, start + seg);
+  return { loopStart: start, loopEnd, seg: loopEnd - start };
 }
 
 export function sliceToMono(buffer, startSec, endSec) {

@@ -6,27 +6,34 @@ lightweight — it only imports os, uuid, time, asyncio, logging,
 fastapi, and pydantic at module level.
 """
 import io
-import os
-import sys
 import pytest
+# These tests exercise ASR-consumer mechanics and assume ASR weights are
+# installed - neutralize the no-ASR preflight (its own suite:
+# tests/test_asr_model_missing.py).
+pytestmark = pytest.mark.usefixtures("asr_model_installed")
 
-# Add backend to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-# Stub core.config before batch imports it
-import types
-config_mod = types.ModuleType("core.config")
-config_mod.DATA_DIR = "/tmp/omnivoice_test_data"
-sys.modules["core.config"] = config_mod
-
+# conftest.py puts `backend/` on sys.path and points OMNIVOICE_DATA_DIR at a
+# throwaway tmpdir before the batch router imports the REAL core.config (the
+# old sys.modules stub leaked at collection time and broke mixed runs).
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from api.routers.batch import router, _jobs, _set_progress
 
 
 @pytest.fixture(autouse=True)
-def reset_state():
-    """Clear in-memory state between tests and disable the worker."""
+def batch():
+    """The batch module, imported at TEST time — never at collection time.
+
+    Clears in-memory state between tests and replaces the worker with a
+    no-op so jobs stay queued. Everything in this file (including the app
+    under test) MUST go through this one module object: earlier suite
+    members (e.g. tests/smoke/test_boot_smoke.py) purge ``api.*`` from
+    ``sys.modules``, so a collection-time ``from api.routers.batch import
+    router`` leaves the app serving STALE-module handlers while the fixture
+    patches a fresh re-import — the stale handlers then start the REAL
+    worker/pipeline, whose cancelled-but-swallowing task used to hang the
+    TestClient portal teardown forever at ~97% of a full-suite run.
+    """
     import api.routers.batch as batch
     batch._jobs.clear()
     batch._queue = None
@@ -50,15 +57,15 @@ def reset_state():
             batch._worker_task = asyncio.ensure_future(_noop())
 
     batch._ensure_queue = _test_ensure_queue
-    yield
+    yield batch
     batch._ensure_queue = original_ensure
     batch._jobs.clear()
 
 
 @pytest.fixture
-def client():
+def client(batch):
     app = FastAPI()
-    app.include_router(router)
+    app.include_router(batch.router)
     return TestClient(app)
 
 
@@ -78,7 +85,7 @@ def _enqueue(client, video_bytes, langs="es", voice_id="", preserve_bg="true"):
 class TestEnqueue:
     def test_returns_job_id(self, client, fake_video):
         resp = _enqueue(client, fake_video, "es,fr")
-        assert resp.status_code == 200
+        assert resp.status_code == 200, resp.text
         body = resp.json()
         assert "job_id" in body
         assert body["status"] == "queued"
@@ -104,6 +111,42 @@ class TestEnqueue:
         job_id = resp.json()["job_id"]
         job = client.get(f"/batch/jobs/{job_id}").json()
         assert job["filename"] == "test.mp4"
+
+    @pytest.mark.asyncio
+    async def test_upload_is_persisted_in_bounded_chunks(self, batch, tmp_path):
+        class RecordingUpload:
+            def __init__(self):
+                self.read_sizes = []
+                self.remaining = b"video"
+
+            async def read(self, size):
+                self.read_sizes.append(size)
+                chunk, self.remaining = self.remaining[:size], self.remaining[size:]
+                return chunk
+
+        upload = RecordingUpload()
+        destination = tmp_path / "video.mp4"
+        await batch._save_upload(upload, str(destination))
+
+        assert destination.read_bytes() == b"video"
+        assert upload.read_sizes == [batch._UPLOAD_CHUNK_BYTES, batch._UPLOAD_CHUNK_BYTES]
+
+    @pytest.mark.asyncio
+    async def test_failed_upload_removes_partial_file(self, batch, tmp_path):
+        class FailingUpload:
+            calls = 0
+
+            async def read(self, _size):
+                self.calls += 1
+                if self.calls == 1:
+                    return b"partial"
+                raise OSError("upload interrupted")
+
+        destination = tmp_path / "video.mp4"
+        with pytest.raises(OSError, match="upload interrupted"):
+            await batch._save_upload(FailingUpload(), str(destination))
+
+        assert not destination.exists()
 
 
 class TestListJobs:
@@ -154,9 +197,9 @@ class TestCancelJob:
         job = client.get(f"/batch/jobs/{r['job_id']}").json()
         assert job["status"] == "cancelled"
 
-    def test_cancel_already_done(self, client, fake_video):
+    def test_cancel_already_done(self, client, batch, fake_video):
         r = _enqueue(client, fake_video).json()
-        _jobs[r["job_id"]]["status"] = "done"
+        batch._jobs[r["job_id"]]["status"] = "done"
         resp = client.post(f"/batch/jobs/{r['job_id']}/cancel")
         assert resp.json()["already"] == "done"
 
@@ -173,19 +216,55 @@ class TestDeleteJob:
         assert client.get(f"/batch/jobs/{r['job_id']}").status_code == 404
 
     def test_delete_not_found(self, client):
-        assert client.delete("/batch/jobs/nope").status_code == 404
+        response = client.delete("/batch/jobs/nope")
+        assert response.status_code == 404
 
 
 class TestSetProgress:
-    def test_basic(self):
+    def test_basic(self, batch):
         job = {}
-        _set_progress(job, "transcribe", 50, segments_count=10)
+        batch._set_progress(job, "transcribe", 50, segments_count=10)
         assert job["progress"]["stage"] == "transcribe"
         assert job["progress"]["percent"] == 50
         assert job["progress"]["segments_count"] == 10
 
-    def test_overwrite(self):
+    def test_overwrite(self, batch):
         job = {"progress": {"stage": "extract", "percent": 100}}
-        _set_progress(job, "generate", 25, current_lang="es")
+        batch._set_progress(job, "generate", 25, current_lang="es")
         assert job["progress"]["stage"] == "generate"
         assert job["progress"]["current_lang"] == "es"
+
+
+class TestWorkerShutdown:
+    def test_worker_task_terminates_on_cancel_mid_job(self, batch, monkeypatch):
+        """Regression guard: `_worker` used to swallow CancelledError and
+        re-enter `_queue.get()`, leaving an immortal task. Event-loop
+        teardown (app shutdown, TestClient per-request portal exit) then
+        hung forever in `_cancel_all_tasks` — the full-suite freeze at ~97%.
+        Cancellation arriving mid-pipeline must mark the job cancelled AND
+        terminate the task."""
+        import asyncio
+
+        async def scenario():
+            started = asyncio.Event()
+
+            async def fake_pipeline(job_id, job):
+                started.set()
+                await asyncio.sleep(3600)
+
+            monkeypatch.setattr(batch, "_run_batch_pipeline", fake_pipeline)
+            batch._queue = asyncio.Queue()
+            task = asyncio.ensure_future(batch._worker())
+            batch._jobs["j1"] = {"status": "queued", "filename": "x.mp4"}
+            await batch._queue.put("j1")
+            await asyncio.wait_for(started.wait(), timeout=5)
+
+            task.cancel()
+            done, _pending = await asyncio.wait({task}, timeout=2)
+            assert task in done, (
+                "worker task must terminate when cancelled mid-job "
+                "(swallowing CancelledError makes shutdown hang forever)"
+            )
+            assert batch._jobs["j1"]["status"] == "cancelled"
+
+        asyncio.run(scenario())
