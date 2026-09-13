@@ -46,9 +46,6 @@ jobs:
     timeout-minutes: 10
     env:
       HF_HUB_OFFLINE: '1'
-      HF_HUB_CACHE: ${{ runner.temp }}/empty-security-hf-cache
-      OMNIVOICE_DATA_DIR: ${{ runner.temp }}/synthetic-security-data
-      OMNIVOICE_ENV_FILE: ${{ runner.temp }}/synthetic-security-user-env
       PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
       PIP_DISABLE_PIP_VERSION_CHECK: '1'
     steps:
@@ -62,6 +59,10 @@ jobs:
         # Direct versions match uv.lock; never install the ML application.
         run: python -m pip install --no-cache-dir pytest==9.1.1 fastapi==0.136.3 httpx==0.28.1 cryptography==50.0.0
       - name: Exercise the three path chains and public error responses
+        env:
+          HF_HUB_CACHE: ${{ runner.temp }}/empty-security-hf-cache
+          OMNIVOICE_DATA_DIR: ${{ runner.temp }}/synthetic-security-data
+          OMNIVOICE_ENV_FILE: ${{ runner.temp }}/synthetic-security-user-env
         run: >-
           python -m pytest -q -rs
           tests/test_codeql_path_boundaries.py
