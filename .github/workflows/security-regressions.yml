@@ -1,0 +1,69 @@
+name: Scoped security regressions
+
+on:
+  push:
+    branches: [codex/repair-security-2026-09-13]
+    paths:
+      - '.github/workflows/security-regressions.yml'
+      - 'backend/services/video_retime.py'
+      - 'backend/services/longform_render.py'
+      - 'backend/services/watermark.py'
+      - 'backend/worker/inbound/service.py'
+      - 'backend/api/routers/audiobook.py'
+      - 'backend/api/routers/tools.py'
+      - 'backend/api/routers/watermark.py'
+      - 'backend/api/dependencies.py'
+      - 'backend/core/auth.py'
+      - 'tests/test_codeql_path_boundaries.py'
+      - 'tests/test_public_detection_and_inbound_errors.py'
+      - 'tests/test_changelog_style.py'
+      - 'CHANGELOG.md'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/security-regressions.yml'
+      - 'backend/services/video_retime.py'
+      - 'backend/services/longform_render.py'
+      - 'backend/services/watermark.py'
+      - 'backend/worker/inbound/service.py'
+      - 'backend/api/routers/audiobook.py'
+      - 'backend/api/routers/tools.py'
+      - 'backend/api/routers/watermark.py'
+      - 'backend/api/dependencies.py'
+      - 'backend/core/auth.py'
+      - 'tests/test_codeql_path_boundaries.py'
+      - 'tests/test_public_detection_and_inbound_errors.py'
+      - 'tests/test_changelog_style.py'
+      - 'CHANGELOG.md'
+
+permissions:
+  contents: read
+
+jobs:
+  boundaries:
+    name: Synthetic API and path boundaries (Ubuntu)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      HF_HUB_OFFLINE: '1'
+      HF_HUB_CACHE: ${{ runner.temp }}/empty-security-hf-cache
+      OMNIVOICE_DATA_DIR: ${{ runner.temp }}/synthetic-security-data
+      OMNIVOICE_ENV_FILE: ${{ runner.temp }}/synthetic-security-user-env
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install only the test boundary dependencies
+        # Direct versions match uv.lock; never install the ML application.
+        run: python -m pip install --no-cache-dir pytest==9.1.1 fastapi==0.136.3 httpx==0.28.1 cryptography==50.0.0
+      - name: Exercise the three path chains and public error responses
+        run: >-
+          python -m pytest -q -rs
+          tests/test_codeql_path_boundaries.py
+          tests/test_public_detection_and_inbound_errors.py
+          tests/test_changelog_style.py

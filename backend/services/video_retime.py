@@ -37,6 +37,7 @@ import asyncio
 import logging
 import os
 import shutil
+import tempfile
 from dataclasses import dataclass
 
 # Module access (not ``from core.config import DUB_DIR``) so the containment
@@ -263,14 +264,17 @@ async def render_retimed_video(
     from core.config import DUB_DIR as _dub_root
     _base = os.path.realpath(_dub_root)
     out_path = os.path.realpath(out_path)
-    if out_path != _base and not out_path.startswith(_base + os.sep):
+    if not out_path.startswith(_base + os.sep):
         raise RetimeError("retime output path escapes the dub workspace",
                           stage="plan")
     batches = partition_batches(chunks, batch_size)
     if not batches:
         raise RetimeError("empty retime plan", stage="plan")
-    slices_dir = out_path + ".slices"
-    os.makedirs(slices_dir, exist_ok=True)
+    # Never reuse a caller-derived directory: a stale .slices directory (or
+    # symlink) could contain unrelated files which cleanup would then remove.
+    # Allocate an exclusive workspace and delete only this invocation's files.
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    slices_dir = tempfile.mkdtemp(prefix=".retime-", dir=os.path.dirname(out_path))
     try:
         slice_paths: list[str] = []
         for bi, batch in enumerate(batches):
@@ -404,7 +408,7 @@ async def prepare_smart_fit_video(
     from core.config import DUB_DIR as _dub_root
     _base = os.path.realpath(_dub_root)
     work_path = os.path.realpath(work_path)
-    if work_path != _base and not work_path.startswith(_base + os.sep):
+    if not work_path.startswith(_base + os.sep):
         raise RetimeError("retime work path escapes the dub workspace",
                           stage="plan")
 

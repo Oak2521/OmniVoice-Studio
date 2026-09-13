@@ -502,7 +502,7 @@ class TestRetimeExecutorIntegration:
         durs = _probe_stream_durations(decision.file_path)
         assert durs["video"] == pytest.approx(_EXPECTED_DUR, abs=0.05)
         # Temp slices cleaned on success.
-        assert not os.path.exists(str(out_path) + ".slices")
+        assert not list(out_path.parent.glob(".retime-*"))
 
     def test_batched_tail_pad_branch_freezes_last_frame(self, test_video, tmp_path):
         """Track outruns the retimed video → tpad extends the final slice."""
@@ -527,7 +527,7 @@ class TestRetimeExecutorIntegration:
                 video_path=str(tmp_path / "missing_input.mp4"),
                 chunks=chunks, out_path=str(out_path), batch_size=2,
             ))
-        assert not os.path.exists(str(out_path) + ".slices")
+        assert not list(out_path.parent.glob(".retime-*"))
         assert not os.path.exists(out_path)
 
 
